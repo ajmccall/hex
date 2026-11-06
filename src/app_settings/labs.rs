@@ -81,6 +81,8 @@ pub struct LabsSettings {
     pub screenshots: bool,
     /// A recording meeting's transcript scrolls to its newest line, until scrolled up (issue 1332).
     pub follow_live_transcript: bool,
+    /// Meetings offers Import audio…: a local audio file becomes a meeting (macOS).
+    pub meeting_import: bool,
     /// With `labs.annotate_replay` on, keeps a rolling 15 s display buffer via `SCClipBufferingOutput` (macOS 27+).
     pub annotate_replay: bool,
     /// Settings › Labs' groups opened or closed by hand, by `labs::Group`
@@ -137,6 +139,7 @@ impl Default for LabsSettings {
             gnome_meeting_capsules: false,
             screenshots: false,
             follow_live_transcript: false,
+            meeting_import: false,
             groups: std::collections::BTreeMap::new(),
         }
     }

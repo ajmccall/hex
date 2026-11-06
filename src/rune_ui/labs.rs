@@ -400,6 +400,14 @@ fn rows(ui: &Ui) -> Vec<Row> {
             tr("Follow live transcript"),
             tr("While a meeting records, the transcript scrolls to the newest line. Scroll up to read earlier text; scroll back to the bottom to follow again."),
         ));
+        if Feature::MeetingImport.on_this_os() {
+            rows.push(row(
+                Feature::MeetingImport,
+                None,
+                tr("Import audio"),
+                tr("Add an audio file to Meetings and transcribe it on this Mac"),
+            ));
+        }
     }
     rows.push(row(
         Feature::VocabularyBiasing,
@@ -738,6 +746,7 @@ fn row_key(lab: Lab) -> &'static str {
         Feature::Screenshots => "lab-screenshots",
         Feature::FollowLiveTranscript => "lab-follow-live-transcript",
         Feature::AnnotateReplay => "lab-annotate-replay",
+        Feature::MeetingImport => "lab-meeting-import",
     }
 }
 

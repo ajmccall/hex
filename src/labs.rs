@@ -111,10 +111,11 @@ pub enum Feature {
     Screenshots,
     FollowLiveTranscript,
     AnnotateReplay,
+    MeetingImport,
 }
 
 impl Feature {
-    pub const ALL: [Self; 47] = [
+    pub const ALL: [Self; 48] = [
         Self::Meetings,
         Self::VoiceFilter,
         Self::Playground,
@@ -162,6 +163,7 @@ impl Feature {
         Self::Screenshots,
         Self::FollowLiveTranscript,
         Self::AnnotateReplay,
+        Self::MeetingImport,
     ];
 
     /// The features this OS and build have.
@@ -233,6 +235,7 @@ impl Feature {
             | Self::Screenshots
             | Self::FollowLiveTranscript
             | Self::AnnotateReplay
+            | Self::MeetingImport
             | Self::NotchIndicator => Audience::Everyone,
         }
     }
@@ -287,6 +290,7 @@ impl Feature {
             | Self::Screenshots
             | Self::FollowLiveTranscript
             | Self::AnnotateReplay => 20261104,
+            Self::MeetingImport => 20261106,
         }
     }
 
@@ -322,7 +326,8 @@ impl Feature {
             | Self::LiveChapters
             | Self::SubtitleExport
             | Self::StopWhenCallEnds
-            | Self::MovableMeetingCapsules => cfg!(target_os = "macos"),
+            | Self::MovableMeetingCapsules
+            | Self::MeetingImport => cfg!(target_os = "macos"),
             Self::VoiceFilter => cfg!(any(target_os = "macos", target_os = "linux")),
             Self::TerminalPaste | Self::ShareShortcut => cfg!(target_os = "windows"),
             Self::SectionKeyAlone | Self::GnomeClipboardRestore | Self::GnomeMeetingCapsules => {
@@ -427,6 +432,7 @@ impl Feature {
             Self::Screenshots => "screenshots",
             Self::FollowLiveTranscript => "follow-live-transcript",
             Self::AnnotateReplay => "annotate-replay",
+            Self::MeetingImport => "meeting-import",
         }
     }
 
@@ -480,6 +486,7 @@ impl Feature {
             Self::Screenshots => "labs.screenshots",
             Self::FollowLiveTranscript => "labs.follow_live_transcript",
             Self::AnnotateReplay => "labs.annotate_replay",
+            Self::MeetingImport => "labs.meeting_import",
         }
     }
 
@@ -609,6 +616,9 @@ impl Feature {
             Self::AnnotateReplay => {
                 "Save the last 15 seconds of your screen with hex capture replay or capture.replay_hotkey; macOS shows the screen-recording dot the whole time it's on (macOS 27+)"
             }
+            Self::MeetingImport => {
+                "Import an audio file into Meetings and transcribe it on this Mac"
+            }
         }
     }
 
@@ -666,6 +676,7 @@ impl Feature {
             Self::Screenshots => settings.labs.screenshots,
             Self::FollowLiveTranscript => settings.labs.follow_live_transcript,
             Self::AnnotateReplay => settings.labs.annotate_replay,
+            Self::MeetingImport => settings.labs.meeting_import,
         }
     }
 
@@ -721,6 +732,7 @@ impl Feature {
             &mut labs.screenshots,
             &mut labs.follow_live_transcript,
             &mut labs.annotate_replay,
+            &mut labs.meeting_import,
         ]
     }
 
@@ -776,6 +788,7 @@ impl Feature {
             Self::Screenshots => settings.labs.screenshots = on,
             Self::FollowLiveTranscript => settings.labs.follow_live_transcript = on,
             Self::AnnotateReplay => settings.labs.annotate_replay = on,
+            Self::MeetingImport => settings.labs.meeting_import = on,
             // Off, no shortcut keeps a key only the feature allows.
             Self::StandaloneSpecialKeys => {
                 settings.labs.standalone_special_keys = on;
@@ -814,7 +827,7 @@ const STOP_WHEN_CALL_ENDS: u64 = 1 << 20;
 const KEEP_RECORDINGS: u64 = 1 << 21;
 const HIDE_MENU_BAR_ICON: u64 = 1 << 22;
 const MOVABLE_MEETING_CAPSULES: u64 = 1 << 23;
-// 1 << 24 was Labs › Choose meeting summary model, now Meetings › Summaries.
+const MEETING_IMPORT: u64 = 1 << 24;
 const GNOME_CLIPBOARD_RESTORE: u64 = 1 << 25;
 const MEETING_NOTES_VOCABULARY: u64 = 1 << 26;
 const NOTCH_INDICATOR: u64 = 1 << 27;
@@ -1036,6 +1049,13 @@ pub fn annotate_replay() -> bool {
     on(ANNOTATE_REPLAY) && Feature::AnnotateReplay.on_this_os()
 }
 
+/// Audio files may be imported as meetings (macOS; read where the Meetings
+/// pane offers Import audio and where an import starts).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn meeting_import() -> bool {
+    on(MEETING_IMPORT) && Feature::MeetingImport.on_this_os()
+}
+
 /// How long the speech model may sit unused before the engine unloads it,
 /// while Labs › Unload model when idle is on.
 pub fn unload_idle() -> Option<std::time::Duration> {
@@ -1160,6 +1180,11 @@ fn encode_where(settings: &LabsSettings, reaches: impl Fn(Feature) -> bool) -> u
             Feature::AnnotateReplay,
             settings.annotate_replay,
             ANNOTATE_REPLAY,
+        ),
+        (
+            Feature::MeetingImport,
+            settings.meeting_import,
+            MEETING_IMPORT,
         ),
         (
             Feature::GnomeMeetingCapsules,
@@ -1699,6 +1724,18 @@ mod tests {
         let state = encode_where(&labs, |_| true);
         assert_ne!(state & GNOME_MEETING_CAPSULES, 0);
         assert_eq!(state & GNOME_CLIPBOARD_RESTORE, 0);
+        assert_eq!(state >> MINUTES_SHIFT, 24 * 60);
+    }
+
+    #[test]
+    fn meeting_import_is_its_own_bit_and_off_by_default() {
+        let mut labs = LabsSettings::default();
+        assert_eq!(encode_where(&labs, |_| true) & MEETING_IMPORT, 0);
+        labs.meeting_import = true;
+        labs.unload_idle_minutes = 24 * 60;
+        let state = encode_where(&labs, |_| true);
+        assert_ne!(state & MEETING_IMPORT, 0);
+        assert_eq!(state & ANNOTATE_REPLAY, 0);
         assert_eq!(state >> MINUTES_SHIFT, 24 * 60);
     }
 
