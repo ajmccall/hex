@@ -748,6 +748,9 @@ pub fn listen(
             let Some(action) = hotkeys.caps_lock_press() else {
                 continue;
             };
+            if action == HotkeyAction::Start {
+                context.set_processing_mode(hotkeys.processing_mode());
+            }
             let accepted = handle_hotkey_action(
                 action,
                 hotkeys.raw_capture,
@@ -762,6 +765,7 @@ pub fn listen(
             )?;
             if !accepted {
                 hotkeys.suspend(Shortcut::CapsLock);
+                context.clear_processing_mode();
             }
         }
         // The capture shortcut ignores keys while shortcuts are suspended or
@@ -830,7 +834,11 @@ pub fn listen(
             }
             for (shortcut, action) in hotkeys.process(input_event, capture_at) {
                 if action == HotkeyAction::Start {
-                    hotkeys.raw_capture = shortcut == Shortcut::Raw;
+                    hotkeys.start_processing(
+                        shortcut,
+                        crate::dictation::config::second_shortcut_mode(),
+                    );
+                    context.set_processing_mode(hotkeys.processing_mode());
                 }
                 let accepted = handle_hotkey_action(
                     action,
@@ -846,6 +854,7 @@ pub fn listen(
                 )?;
                 if !accepted {
                     hotkeys.suspend(shortcut);
+                    context.clear_processing_mode();
                 }
             }
         }
@@ -1227,20 +1236,21 @@ fn handle_hotkey_action(
         HotkeyAction::Finish => {
             // The capture's own page, or none rather than the last
             // dictation's.
-            let context = context.finish(events)?;
-            finish_hotkey_dictation(
+            let capture_context = context.finish(events)?;
+            let finished = finish_hotkey_dictation(
                 action_at,
                 dictation,
                 worker,
-                &context,
+                &capture_context,
                 device,
                 events,
                 indicator,
                 release_while_idle,
                 None,
                 raw,
-            )
-            .map(drop)
+            );
+            context.clear_processing_mode();
+            finished.map(drop)
         }
         HotkeyAction::Discard(_) | HotkeyAction::Cancel | HotkeyAction::CancelShortcut => {
             context.cancel();
@@ -1419,7 +1429,15 @@ fn control_dictation(
                     "the dictation shortcut is held; release it and try again",
                 ));
             }
-            hotkeys.raw_capture = raw;
+            hotkeys.start_processing(
+                if raw {
+                    Shortcut::Raw
+                } else {
+                    Shortcut::Dictation
+                },
+                None,
+            );
+            context.set_processing_mode(None);
             let accepted = handle_hotkey_action(
                 HotkeyAction::Start,
                 raw,
@@ -1454,12 +1472,12 @@ fn control_dictation(
             let printing = print.is_some();
             // A control capture asked for its page when it started; this
             // waits for that read if it is still in flight.
-            let context = context.finish(events)?;
+            let capture_context = context.finish(events)?;
             let finished = finish_hotkey_dictation(
                 capture_boundary(input, release_while_idle),
                 input,
                 worker,
-                &context,
+                &capture_context,
                 &device,
                 events,
                 indicator,
@@ -1467,6 +1485,7 @@ fn control_dictation(
                 print,
                 hotkeys.raw_capture,
             )?;
+            context.clear_processing_mode();
             match finished {
                 FinishResult::Discarded | FinishResult::Silent if printing => {
                     ControlReply::error("no-speech", "no speech was recorded; nothing to print")
@@ -1788,6 +1807,7 @@ mod tests {
             extra: std::array::from_fn(|_| None),
             caps_lock: DictationHotkey::new(base, false, RuntimeHotkey::default()),
             raw_capture: false,
+            mode_capture: None,
         };
         let mut press = |flags: u64, ms: u64| hotkeys.process(InputEvent::Flags(flags), at(ms));
         const START: HotkeyAction = HotkeyAction::Start;
@@ -1836,6 +1856,7 @@ mod tests {
             extra: std::array::from_fn(|_| None),
             caps_lock: DictationHotkey::new(base, false, RuntimeHotkey::default()),
             raw_capture: false,
+            mode_capture: None,
         };
         hotkeys.rebind_extra(bindings, base);
         let cancel = crate::app_settings::HotkeyBinding::cancel_default().runtime();
@@ -2084,6 +2105,7 @@ mod tests {
             extra: std::array::from_fn(|_| None),
             caps_lock,
             raw_capture: false,
+            mode_capture: None,
         }
     }
 

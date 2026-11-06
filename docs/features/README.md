@@ -709,7 +709,10 @@ General > Shortcut mode -> Hold or double-tap (default), Hold, Tap, Double-tap
 Labs > Second dictation shortcut (macOS, off)   // labs.md; issue 627
   -> General shows "Second dictation shortcut" under Shortcut (unbound, clearable)
   -> it dictates like the shortcut: Hold/Toggle, double-tap lock, release
+  -> Processing below it: Default (automatic), Global, or a named mode (personal fork)
   -> the shortcut that starts a capture finishes it; the other stands down meanwhile
+  -> explicit mode is latched at start; Global filler removal and replacements still run first
+     // docs/personal-reword.md; settings key dictation_processing.second_shortcut_mode
 
 Labs > More dictation shortcuts (macOS, off)   // labs.md
   -> General shows a numbered row per extra (recorder, shortcut mode, Remove) and Add shortcut under four
@@ -1169,8 +1172,10 @@ Output (main sidebar, replaces the Modes editor) // rune_ui/output.rs; scenes ou
 └── In some apps -> Each mode's apps and its steps (Only: …), opens to list them
     // the old Modes editor stays in the code for its scenes, unreachable
 
-Foreground context -> Select processing
-├── Matching website                     // macOS: scriptable browsers, then AXWebArea; Windows: UIA; Linux: AT-SPI
+Dictation -> Select processing
+├── Second shortcut with an explicit mode (macOS personal fork) -> named mode, even without app/site rules
+│   └── Missing/ambiguous name -> Global, not a foreground app's rewrite
+├── Otherwise matching website                     // macOS: scriptable browsers, then AXWebArea; Windows: UIA; Linux: AT-SPI
 ├── Otherwise matching application
 ├── Hex itself in front                  // application only: Hex never reads its own AX tree (#1402)
 └── Otherwise Global
@@ -1184,6 +1189,15 @@ Selected mode                            // replaces Global's rewrite and transf
 
 Stage fails -> Preserve its input        // failed chain discards partial results
 ```
+
+Personal fork's optional [Reword shortcut](../personal-reword.md) reuses the
+existing macOS Second dictation shortcut lab, off by default. The normal key
+retains automatic context selection; raw dictation still skips all processing.
+The named-mode selector and Global cleanup are checked in
+`dictation::config` and `recognition::tests`; the setup script's preservation,
+private backup, and rollback are checked by `scripts/test-configure-reword.py`.
+`mac-settings-reword` is a macOS-only headless scene. Native shortcuts,
+provider output, and pasting into Slack are not established by these checks.
 
 **Fixed November 1, 2026 (issue 949):** every OpenCode rewrite's fixed
 instructions (`PROTOCOL_PROMPT`) now say to keep every number as said (no

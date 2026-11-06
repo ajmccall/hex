@@ -611,8 +611,15 @@ on, a binding saved, and no overlap does `RuntimeHotkeys::second_dictation`
 carry it, so the event tap suppresses its keys and the listener
 (`recognition::Hotkeys`) runs a second shortcut machine with the dictation
 shortcut's Hold/Toggle, double-tap lock, and double-tap-only settings. It
-dictates and pastes with processing, as the dictation shortcut does; Paste
-last and meeting paste still come only from the main machine. The shortcut
+dictates and pastes with processing, as the dictation shortcut does. This
+personal fork adds a Processing selector below the recorder:
+`dictation_processing.second_shortcut_mode` is `none` by default (automatic
+app/site selection), or `Global`, or a unique named mode such as Reword.
+Only captures started with the second shortcut use that explicit mode;
+Global filler removal and replacements still run first. The name is latched
+at start and carried through release, queueing, and CLI stop/print. Missing
+or ambiguous saved names fall back to Global. See [personal Reword setup](../personal-reword.md).
+Paste last and meeting paste still come only from the main machine. The shortcut
 that starts a capture finishes or cancels it, and the other stands down
 until its keys lift while it records. Turning the toggle off or clearing the
 binding mid-capture cancels that capture. Off, nothing is matched,

@@ -8,6 +8,17 @@ use crate::dictation::text_replacements::ReplacementSet;
 static DICTATION_PROFILES: OnceLock<RwLock<Profiles>> = OnceLock::new();
 static READS_BROWSER: AtomicBool = AtomicBool::new(false);
 static READS_WINDOW_TITLE: AtomicBool = AtomicBool::new(false);
+static SECOND_SHORTCUT_MODE: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+/// The name is latched by the shortcut that starts a capture, not read again
+/// on release or when a queued dictation reaches the output worker.
+pub(crate) fn second_shortcut_mode() -> Option<String> {
+    SECOND_SHORTCUT_MODE
+        .get_or_init(Default::default)
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
 
 /// Whether anything the user set up looks at the page: a mode chosen by
 /// website, an OpenCode rewrite (its prompt names the site), or a script
@@ -43,6 +54,10 @@ pub fn dictation_profiles() -> Profiles {
 
 pub fn update_dictation_profiles(settings: &DictationProcessingSettings) {
     let profiles = build_dictation_profiles(settings);
+    *SECOND_SHORTCUT_MODE
+        .get_or_init(Default::default)
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = settings.second_shortcut_mode.clone();
     READS_BROWSER.store(uses_browser(settings), Ordering::Release);
     READS_WINDOW_TITLE.store(uses_scripts(settings), Ordering::Release);
     *dictation_profiles_lock()
@@ -72,6 +87,7 @@ fn build_dictation_profiles(settings: &DictationProcessingSettings) -> Profiles 
     .global_replacements(ReplacementSet::new(&global.replacements));
     for mode in &settings.modes {
         let profile = Profile::from_mode(mode);
+        profiles = profiles.named(profile.clone());
         for application in &mode.applications {
             profiles = profiles.application(application.clone(), profile.clone());
         }
@@ -86,6 +102,105 @@ fn build_dictation_profiles(settings: &DictationProcessingSettings) -> Profiles 
 mod tests {
     use super::*;
     use crate::dictation::context::ContextSnapshot;
+
+    #[test]
+    fn second_shortcut_selects_a_mode_without_app_rules_and_keeps_global_cleanup() {
+        use crate::app_settings::{DictationMode, TextReplacement};
+        let mut settings = DictationProcessingSettings {
+            second_shortcut_mode: Some("Reword".into()),
+            modes: vec![DictationMode {
+                name: "Reword".into(),
+                replacements: vec![TextReplacement {
+                    matched_phrase: "tomorrow".into(),
+                    output: "next week".into(),
+                }],
+                transformations: vec!["lowercase".into()],
+                ..DictationMode::default()
+            }],
+            ..DictationProcessingSettings::default()
+        };
+        settings.default_mode.replacements = vec![TextReplacement {
+            matched_phrase: "um".into(),
+            output: String::new(),
+        }];
+        let profiles = build_dictation_profiles(&settings);
+        let context = ContextSnapshot::default();
+        let process = |context: &ContextSnapshot| {
+            profiles.process_cancellable("Um, ship tomorrow.", context, &AtomicBool::new(false))
+        };
+        assert_eq!(process(&context).text, "Ship tomorrow.");
+        assert!(!profiles.processes(&context));
+        let explicit = ContextSnapshot {
+            processing_mode: settings.second_shortcut_mode.clone(),
+            ..context
+        };
+        let processed = process(&explicit);
+        assert_eq!(processed.text, "Ship next week.");
+        assert_eq!(processed.transformations, ["lowercase"]);
+        assert!(profiles.processes(&explicit));
+    }
+
+    #[test]
+    fn reword_failure_keeps_filler_cleanup_and_global_replacements() {
+        let mode: crate::app_settings::DictationMode =
+            serde_json::from_str(include_str!("../../resources/reword-mode.json")).unwrap();
+        assert!(mode.post_processing.enabled);
+        assert!(mode.post_processing.model.is_none());
+        let mut settings = DictationProcessingSettings {
+            modes: vec![mode],
+            ..DictationProcessingSettings::default()
+        };
+        settings.default_mode.replacements = vec![crate::app_settings::TextReplacement {
+            matched_phrase: "ship".into(),
+            output: "send".into(),
+        }];
+        crate::labs::apply(&crate::app_settings::LabsSettings {
+            filler_words: true,
+            ..Default::default()
+        });
+        let profiles = build_dictation_profiles(&settings);
+        let context = ContextSnapshot {
+            processing_mode: Some("Reword".into()),
+            ..Default::default()
+        };
+        // Cancellation before discovery avoids any live service/provider call.
+        let processed = profiles.process_cancellable(
+            "Um, we should uh ship it.",
+            &context,
+            &AtomicBool::new(true),
+        );
+        crate::labs::apply(&crate::app_settings::LabsSettings::default());
+        assert_eq!(processed.text, "We should send it.");
+        let observation = processed.observation.unwrap();
+        assert_eq!(observation.profile, "Reword");
+        assert!(observation.fallback.is_some());
+    }
+
+    #[test]
+    fn an_explicit_mode_wins_over_websites_and_missing_modes_fall_back_to_global() {
+        use crate::app_settings::DictationMode;
+        let settings = DictationProcessingSettings {
+            modes: vec![DictationMode {
+                name: "Slack".into(),
+                browser_hosts: vec!["slack.com".into()],
+                transformations: vec!["lowercase".into()],
+                ..DictationMode::default()
+            }],
+            ..DictationProcessingSettings::default()
+        };
+        let profiles = build_dictation_profiles(&settings);
+        let mut context = ContextSnapshot {
+            browser_url: Some("https://slack.com".parse().unwrap()),
+            ..ContextSnapshot::default()
+        };
+        assert!(profiles.processes(&context));
+        for name in ["Global", "Deleted mode"] {
+            context.processing_mode = Some(name.into());
+            assert!(!profiles.processes(&context));
+        }
+        context.processing_mode = Some(" slack ".into());
+        assert!(profiles.processes(&context));
+    }
 
     #[test]
     fn configured_mode_profiles_match_application_context() {

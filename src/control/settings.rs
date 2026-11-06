@@ -302,6 +302,12 @@ const KEYS: &[Key] = &[
         Kind::Json,
         "Modes for specific apps and websites, as a JSON array",
     ),
+    optional(
+        "dictation_processing.second_shortcut_mode",
+        Kind::Text,
+        "Labs: named mode for the second dictation shortcut (macOS); Global selects \
+         Global alone; none keeps automatic app/site selection. Global replacements always run",
+    ),
     key(
         "history_retention",
         Kind::Choice(&["off", "day", "week", "month", "forever"]),
@@ -1257,6 +1263,23 @@ pub fn apply(
         "dictation_processing.default_mode" => {
             candidate.dictation_processing.default_mode.name = "Global".into();
         }
+        "dictation_processing.second_shortcut_mode" => {
+            if let Some(mode) = candidate.dictation_processing.second_shortcut_mode.as_mut() {
+                *mode = mode.trim().to_owned();
+                let matches = candidate
+                    .dictation_processing
+                    .modes
+                    .iter()
+                    .filter(|candidate| candidate.name.trim().eq_ignore_ascii_case(mode))
+                    .count();
+                if !mode.eq_ignore_ascii_case("Global") && matches != 1 {
+                    return Err(invalid(
+                        name,
+                        "choose Global or a unique existing mode name; none restores automatic selection",
+                    ));
+                }
+            }
+        }
         "dictation_processing.modes" => {
             let mut names = std::collections::HashSet::new();
             for mode in &candidate.dictation_processing.modes {
@@ -1635,6 +1658,10 @@ mod tests {
                 term: "Rune".into(),
                 sounds_like: vec!["roon".into()],
             }],
+            dictation_processing: crate::app_settings::DictationProcessingSettings {
+                second_shortcut_mode: Some("Global".into()),
+                ..Default::default()
+            },
             meetings: crate::app_settings::MeetingSettings {
                 retention: Some(crate::app_settings::MeetingRetention::Day),
                 audio_retention: Some(crate::app_settings::MeetingRetention::Day),
@@ -1668,6 +1695,50 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), keys().count(), "a key is listed twice");
+    }
+
+    #[test]
+    fn second_shortcut_mode_accepts_only_global_or_a_unique_named_mode() {
+        let mut settings = AppSettings::default();
+        settings
+            .dictation_processing
+            .modes
+            .push(crate::app_settings::DictationMode {
+                name: "Reword".into(),
+                ..Default::default()
+            });
+        let key = "dictation_processing.second_shortcut_mode";
+        for name in ["Global", "Reword", " reword "] {
+            let change = apply(&settings, key, name, &rules()).unwrap();
+            assert_eq!(
+                change
+                    .settings
+                    .dictation_processing
+                    .second_shortcut_mode
+                    .as_deref(),
+                Some(name.trim())
+            );
+        }
+        for name in ["Missing", "", " "] {
+            assert_eq!(
+                apply(&settings, key, name, &rules()).unwrap_err().code,
+                "invalid-value"
+            );
+        }
+        let selected = apply(&settings, key, "Reword", &rules()).unwrap().settings;
+        assert!(
+            apply(&selected, key, "none", &rules())
+                .unwrap()
+                .settings
+                .dictation_processing
+                .second_shortcut_mode
+                .is_none()
+        );
+        settings
+            .dictation_processing
+            .modes
+            .push(settings.dictation_processing.modes[0].clone());
+        assert!(apply(&settings, key, "Reword", &rules()).is_err());
     }
 
     #[test]

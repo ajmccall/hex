@@ -25,6 +25,8 @@ pub(super) struct ContextWatch {
     activity: InputActivity,
     /// The one refresh this capture owes, if any.
     capture: CaptureRefresh,
+    /// An explicit mode owned by the current capture's initiating shortcut.
+    processing_mode: Option<String>,
 }
 
 impl ContextWatch {
@@ -34,6 +36,7 @@ impl ContextWatch {
             snapshot: ContextSnapshot::default(),
             activity,
             capture: CaptureRefresh::default(),
+            processing_mode: None,
         }
     }
 
@@ -51,7 +54,7 @@ impl ContextWatch {
         }
         let switched_app = self.snapshot.application != next.application;
         self.snapshot = next;
-        crate::dictation::vocabulary::focus(&self.snapshot);
+        crate::dictation::vocabulary::focus(&self.snapshot_with_processing_mode());
         if switched_app {
             events.emit(&VoiceEvent::Context {
                 timestamp_ms: now_ms(),
@@ -59,6 +62,26 @@ impl ContextWatch {
             })?;
         }
         Ok(())
+    }
+
+    /// Sets the processing mode latched by the shortcut that starts this
+    /// capture, so vocabulary refreshes and the finished job use the same
+    /// selected mode even if the foreground context changes.
+    pub(super) fn set_processing_mode(&mut self, mode: Option<String>) {
+        self.processing_mode = mode;
+        crate::dictation::vocabulary::focus(&self.snapshot_with_processing_mode());
+    }
+
+    pub(super) fn clear_processing_mode(&mut self) {
+        self.processing_mode = None;
+        crate::dictation::vocabulary::focus(&self.snapshot);
+    }
+
+    fn snapshot_with_processing_mode(&self) -> ContextSnapshot {
+        ContextSnapshot {
+            processing_mode: self.processing_mode.clone(),
+            ..self.snapshot.clone()
+        }
     }
 
     /// A shortcut's press started a capture. It may still be a provisional
@@ -78,6 +101,7 @@ impl ContextWatch {
     /// The capture ended without transcribing: no finish waits for its page.
     pub(super) fn cancel(&mut self) {
         self.capture.cancel();
+        self.clear_processing_mode();
     }
 
     /// The context to hand a finished capture: the refreshed page when it
@@ -88,7 +112,7 @@ impl ContextWatch {
     pub(super) fn finish(&mut self, events: &mut EventLog) -> Result<ContextSnapshot> {
         let monitor = &self.monitor;
         let Some(ticket) = self.capture.finish(|| monitor.request_refresh()) else {
-            return Ok(self.snapshot.clone());
+            return Ok(self.snapshot_with_processing_mode());
         };
         let deadline = Instant::now() + REFRESH_WAIT;
         loop {
@@ -97,7 +121,7 @@ impl ContextWatch {
             // delivered, so this drain takes it or a newer one.
             self.drain(events)?;
             if refreshed {
-                return Ok(self.snapshot.clone());
+                return Ok(self.snapshot_with_processing_mode());
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Ok(self.without_page());
@@ -122,7 +146,7 @@ impl ContextWatch {
     fn without_page(&self) -> ContextSnapshot {
         let snapshot = ContextSnapshot {
             browser_url: None,
-            ..self.snapshot.clone()
+            ..self.snapshot_with_processing_mode()
         };
         crate::dictation::vocabulary::focus(&snapshot);
         snapshot
