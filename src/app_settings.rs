@@ -28,6 +28,7 @@ mod shortcut_repair;
 
 #[cfg(hex_capture)]
 pub use capture::*;
+pub(crate) use dictation_processing::mode_names_match;
 pub use dictation_processing::{
     DictationMode, DictationPostProcessing, DictationProcessingSettings,
 };

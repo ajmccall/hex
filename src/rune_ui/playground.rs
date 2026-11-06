@@ -25,6 +25,7 @@ const LINUX_WINDOWS: &str = "Linux & Windows";
 const PATHS: &[(&str, &str)] = &[
     ("mac-settings", "Window/General/Settings"),
     ("mac-settings-sides", "Window/General/Left Option shortcut"),
+    ("mac-settings-reword", "Window/General/Reword shortcut"),
     ("toggle-cancel", "Window/General/Toggle cancel shortcut"),
     (
         "portal-toggle-cancel",

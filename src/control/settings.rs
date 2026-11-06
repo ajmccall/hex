@@ -269,6 +269,12 @@ const KEYS: &[Key] = &[
         Kind::Json,
         "Modes for specific apps and websites, as a JSON array",
     ),
+    optional(
+        "dictation_processing.second_shortcut_mode",
+        Kind::Text,
+        "Labs: named mode for the second dictation shortcut (macOS); Global selects \
+         Global alone; none keeps automatic app/site selection. Global replacements always run",
+    ),
     key(
         "history_retention",
         Kind::Choice(&["off", "day", "week", "month", "forever"]),
@@ -715,6 +721,10 @@ const NEEDS: &[(&str, &str)] = &[
     ("keyboard_model_switching.", "keyboard_model_switching"),
     ("enable_on_launch", "listener_control"),
     ("share_dictation_shortcut", "share_shortcut"),
+    (
+        "dictation_processing.second_shortcut_mode",
+        "second_dictation_shortcut",
+    ),
 ];
 
 /// The capability `key` needs, if any.
@@ -1053,6 +1063,25 @@ pub fn apply(
         }
         "dictation_processing.default_mode" => {
             candidate.dictation_processing.default_mode.name = "Global".into();
+        }
+        "dictation_processing.second_shortcut_mode" => {
+            if let Some(mode) = candidate.dictation_processing.second_shortcut_mode.as_mut() {
+                *mode = mode.trim().to_owned();
+                let matches = candidate
+                    .dictation_processing
+                    .modes
+                    .iter()
+                    .filter(|candidate| {
+                        crate::app_settings::mode_names_match(&candidate.name, mode)
+                    })
+                    .count();
+                if !crate::app_settings::mode_names_match(mode, "Global") && matches != 1 {
+                    return Err(invalid(
+                        name,
+                        "choose Global or a unique existing mode name; none restores automatic selection",
+                    ));
+                }
+            }
         }
         "dictation_processing.modes" => {
             let mut names = std::collections::HashSet::new();
@@ -1526,6 +1555,10 @@ mod tests {
                 term: "Rune".into(),
                 sounds_like: vec!["roon".into()],
             }],
+            dictation_processing: crate::app_settings::DictationProcessingSettings {
+                second_shortcut_mode: Some("Global".into()),
+                ..Default::default()
+            },
             meetings: crate::app_settings::MeetingSettings {
                 retention: Some(crate::app_settings::MeetingRetention::Day),
                 opencode_model: Some("anthropic/claude-haiku".into()),
@@ -1558,6 +1591,64 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), keys().count(), "a key is listed twice");
+    }
+
+    #[test]
+    fn second_shortcut_mode_is_available_only_on_macos() {
+        let key = "dictation_processing.second_shortcut_mode";
+        let shown = get(&AppSettings::default(), key).unwrap();
+        assert_eq!(shown[0].available, cfg!(target_os = "macos"));
+        if cfg!(target_os = "macos") {
+            assert!(unavailable(key).is_none());
+        } else {
+            assert_eq!(unavailable(key).unwrap().code, "unsupported");
+        }
+    }
+
+    #[test]
+    fn second_shortcut_mode_accepts_only_global_or_a_unique_named_mode() {
+        let mut settings = AppSettings::default();
+        settings
+            .dictation_processing
+            .modes
+            .push(crate::app_settings::DictationMode {
+                name: "Reword".into(),
+                ..Default::default()
+            });
+        let key = "dictation_processing.second_shortcut_mode";
+        for name in ["Global", "Reword", " reword "] {
+            let change = apply(&settings, key, name, &rules()).unwrap();
+            assert_eq!(
+                change
+                    .settings
+                    .dictation_processing
+                    .second_shortcut_mode
+                    .as_deref(),
+                Some(name.trim())
+            );
+        }
+        for name in ["Missing", "Reword typo"] {
+            assert_eq!(
+                apply(&settings, key, name, &rules()).unwrap_err().code,
+                "invalid-value"
+            );
+        }
+        let selected = apply(&settings, key, "Reword", &rules()).unwrap().settings;
+        for clear in ["none", "null", "", " "] {
+            assert!(
+                apply(&selected, key, clear, &rules())
+                    .unwrap()
+                    .settings
+                    .dictation_processing
+                    .second_shortcut_mode
+                    .is_none()
+            );
+        }
+        settings
+            .dictation_processing
+            .modes
+            .push(settings.dictation_processing.modes[0].clone());
+        assert!(apply(&settings, key, "Reword", &rules()).is_err());
     }
 
     #[test]

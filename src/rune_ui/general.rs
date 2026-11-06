@@ -85,8 +85,10 @@ fn basics(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
         }
         // Labs › Second dictation shortcut (macOS): another key that
         // dictates like the one above, such as on an external keyboard.
-        #[cfg(target_os = "macos")]
-        if crate::labs::Feature::SecondDictationShortcut.on(&ui.settings) {
+        if ui.platform.caps.os == super::platform::Os::Macos
+            && crate::labs::Feature::SecondDictationShortcut.on(&ui.settings)
+        {
+            #[cfg(target_os = "macos")]
             rows.extend(shortcut_rows(
                 ui,
                 p,
@@ -94,8 +96,9 @@ fn basics(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
                 &KEYBOARD,
                 tr("Second dictation shortcut"),
                 ShortcutTarget::SecondDictation,
-                Some(tr("Dictates like the shortcut above")),
+                None,
             ));
+            rows.push(super::second_shortcut::processing_row(ui, p, layer));
         }
         // Annotate's shortcut beside dictation's on Linux, where the desktop
         // lists both and a lone F9 is otherwise easy to miss (#723).

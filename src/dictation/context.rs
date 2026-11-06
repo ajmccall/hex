@@ -26,6 +26,9 @@ pub struct ContextSnapshot {
     pub browser_url: Option<Url>,
     pub window_title: Option<String>,
     pub input_revision: Option<u64>,
+    /// An explicit processing mode, latched by the dictation shortcut.
+    /// Foreground context capture leaves this unset (automatic selection).
+    pub processing_mode: Option<String>,
 }
 
 pub struct ContextMonitor {
@@ -153,6 +156,7 @@ impl ContextSnapshot {
                         browser_url: Some(browser_url),
                         window_title,
                         input_revision: None,
+                        processing_mode: None,
                     });
                 }
                 Ok(None) => {}
@@ -193,6 +197,7 @@ impl ContextSnapshot {
                     browser_url: url,
                     window_title: title,
                     input_revision: None,
+                    processing_mode: None,
                 });
             }
         }
@@ -267,6 +272,7 @@ fn capture_macos(reads: Reads) -> Result<ContextSnapshot> {
         browser_url,
         window_title,
         input_revision: None,
+        processing_mode: None,
     })
 }
 
