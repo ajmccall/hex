@@ -1196,7 +1196,8 @@ retains automatic context selection; raw dictation still skips all processing.
 The named-mode selector and Global cleanup are checked in
 `dictation::config` and `recognition::tests`; the setup script's preservation,
 private backup, and rollback are checked by `scripts/test-configure-reword.py`.
-`mac-settings-reword` is a macOS-only headless scene. Native shortcuts,
+`mac-settings-reword` previews the selector with simulated macOS capabilities
+on Linux too; the existing shortcut recorder itself is macOS-only. Native shortcuts,
 provider output, and pasting into Slack are not established by these checks.
 
 **Fixed November 1, 2026 (issue 949):** every OpenCode rewrite's fixed

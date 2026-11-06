@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use serde::{Deserialize, Serialize};
 
+use crate::app_settings::mode_names_match;
 use crate::desktop::opencode_service::Service;
 use crate::dictation::context::{ContextSelector, ContextSnapshot};
 use crate::dictation::text_replacements::ReplacementSet;
@@ -330,13 +331,13 @@ impl Profiles {
     fn select<'a>(&'a self, context: &ContextSnapshot) -> &'a Profile {
         if let Some(name) = &context.processing_mode {
             let name = name.trim();
-            if name.eq_ignore_ascii_case("Global") {
+            if mode_names_match(name, "Global") {
                 return &self.default;
             }
             let mut matches = self
                 .named
                 .iter()
-                .filter(|profile| profile.name.trim().eq_ignore_ascii_case(name));
+                .filter(|profile| mode_names_match(&profile.name, name));
             // A renamed/deleted or ambiguous mode must not silently run the
             // foreground app's unrelated rewrite. Keep Global cleanup instead.
             return match (matches.next(), matches.next()) {

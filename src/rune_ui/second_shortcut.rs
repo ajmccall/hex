@@ -2,8 +2,9 @@
 
 use rune::El;
 
-use super::controls::{CardRow, Choice, Paint, select, setting_row};
+use super::controls::{CardRow, Choice, Paint, icon_row, select};
 use super::{Menu, Ui};
+use crate::app_settings::mode_names_match;
 use crate::desktop::i18n::tr;
 
 pub(super) fn processing_row(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> CardRow {
@@ -18,7 +19,7 @@ pub(super) fn processing_row(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> CardRow 
     ];
     for mode in &ui.settings.dictation_processing.modes {
         let name = mode.name.trim();
-        if !name.is_empty() && !name.eq_ignore_ascii_case("Global") {
+        if !name.is_empty() && !mode_names_match(name, "Global") {
             choices.push(choice(name, Some(name), selected));
         }
     }
@@ -32,14 +33,22 @@ pub(super) fn processing_row(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> CardRow 
         |ui| super::settings::toggle_menu(ui, Menu::Pick("second-shortcut-mode")),
         layer,
     );
-    setting_row(p, "second-shortcut-mode", tr("Processing"), None, control).into()
+    icon_row(
+        p,
+        "second-shortcut-mode",
+        &super::icons::SPARKLES,
+        tr("Processing"),
+        None,
+        control,
+    )
+    .into()
 }
 
 fn choice(label: &str, mode: Option<&str>, selected: Option<&str>) -> Choice {
     let picked = mode.map(str::to_owned);
     let selected = match (mode, selected) {
         (None, None) => true,
-        (Some(mode), Some(selected)) => mode.eq_ignore_ascii_case(selected.trim()),
+        (Some(mode), Some(selected)) => mode_names_match(mode, selected),
         _ => false,
     };
     Choice {

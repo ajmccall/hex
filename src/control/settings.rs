@@ -890,6 +890,10 @@ const NEEDS: &[(&str, &str)] = &[
     ("keyboard_model_switching.", "keyboard_model_switching"),
     ("enable_on_launch", "listener_control"),
     ("share_dictation_shortcut", "share_shortcut"),
+    (
+        "dictation_processing.second_shortcut_mode",
+        "second_dictation_shortcut",
+    ),
 ];
 
 /// The capability `key` needs, if any.
@@ -1270,9 +1274,11 @@ pub fn apply(
                     .dictation_processing
                     .modes
                     .iter()
-                    .filter(|candidate| candidate.name.trim().eq_ignore_ascii_case(mode))
+                    .filter(|candidate| {
+                        crate::app_settings::mode_names_match(&candidate.name, mode)
+                    })
                     .count();
-                if !mode.eq_ignore_ascii_case("Global") && matches != 1 {
+                if !crate::app_settings::mode_names_match(mode, "Global") && matches != 1 {
                     return Err(invalid(
                         name,
                         "choose Global or a unique existing mode name; none restores automatic selection",
@@ -1698,6 +1704,18 @@ mod tests {
     }
 
     #[test]
+    fn second_shortcut_mode_is_available_only_on_macos() {
+        let key = "dictation_processing.second_shortcut_mode";
+        let shown = get(&AppSettings::default(), key).unwrap();
+        assert_eq!(shown[0].available, cfg!(target_os = "macos"));
+        if cfg!(target_os = "macos") {
+            assert!(unavailable(key).is_none());
+        } else {
+            assert_eq!(unavailable(key).unwrap().code, "unsupported");
+        }
+    }
+
+    #[test]
     fn second_shortcut_mode_accepts_only_global_or_a_unique_named_mode() {
         let mut settings = AppSettings::default();
         settings
@@ -1719,21 +1737,23 @@ mod tests {
                 Some(name.trim())
             );
         }
-        for name in ["Missing", "", " "] {
+        for name in ["Missing", "Reword typo"] {
             assert_eq!(
                 apply(&settings, key, name, &rules()).unwrap_err().code,
                 "invalid-value"
             );
         }
         let selected = apply(&settings, key, "Reword", &rules()).unwrap().settings;
-        assert!(
-            apply(&selected, key, "none", &rules())
-                .unwrap()
-                .settings
-                .dictation_processing
-                .second_shortcut_mode
-                .is_none()
-        );
+        for clear in ["none", "null", "", " "] {
+            assert!(
+                apply(&selected, key, clear, &rules())
+                    .unwrap()
+                    .settings
+                    .dictation_processing
+                    .second_shortcut_mode
+                    .is_none()
+            );
+        }
         settings
             .dictation_processing
             .modes

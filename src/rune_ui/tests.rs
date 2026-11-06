@@ -1302,6 +1302,52 @@ fn history_selects_deletes_and_clears_in_two_steps() {
 }
 
 #[test]
+fn second_shortcut_processing_selects_a_named_mode_or_automatic_without_changing_the_main_key() {
+    let mut rt = runtime("mac-settings-reword", true, PANE_SIZE);
+    let main = rt.state.settings.dictation_hotkey.clone();
+    assert_eq!(
+        rt.state
+            .settings
+            .dictation_processing
+            .second_shortcut_mode
+            .as_deref(),
+        Some("Reword")
+    );
+    for (label, selected) in [
+        ("Default", None),
+        ("Global", Some("Global")),
+        ("Reword", Some("Reword")),
+    ] {
+        tap(&mut rt, "second-shortcut-mode-field-trigger");
+        let item = menu_item(&rt, "second-shortcut-mode", label);
+        tap(&mut rt, &item);
+        assert_eq!(
+            rt.state
+                .settings
+                .dictation_processing
+                .second_shortcut_mode
+                .as_deref(),
+            selected
+        );
+        assert_eq!(rt.state.settings.dictation_hotkey, main);
+    }
+    let off = runtime("mac-settings", true, PANE_SIZE);
+    assert!(off.find("second-shortcut-mode-field-trigger").is_none());
+    let mut linux = runtime("portal", true, PANE_SIZE);
+    linux.state.settings.labs.second_dictation_shortcut = true;
+    linux.invalidate();
+    settle(&mut linux);
+    assert!(linux.find("second-shortcut-mode-field-trigger").is_none());
+}
+
+#[test]
+fn second_shortcut_processing_goldens() {
+    for dark in [true, false] {
+        check_golden("mac-settings-reword", dark, PANE_SIZE);
+    }
+}
+
+#[test]
 fn history_stats_button_opens_and_closes_the_dialog() {
     let mut rt = runtime("history", true, PANE_SIZE);
     assert!(!rt.state.settings.labs.history_stats);
