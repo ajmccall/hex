@@ -60,6 +60,9 @@ To disable that shortcut entirely: `hex labs off second-dictation-shortcut`.
 - `scripts/check dictation::config`: explicit modes without app rules, Global corrections first, manual precedence over websites, missing-mode recovery, the real preset's cleaned fallback without any provider call.
 - `scripts/check second_shortcut`: optional-setting validation, mode latching, main/raw starts clearing the override, queued context independence.
 - `scripts/check dictation::processor`: existing ordering, model selection, cancellation, and deadline behavior.
-- `python3 scripts/test-configure-reword.py`: read-only preview safety, preserving customized modes/shortcuts, idempotence, legacy-app refusal, private backup and rollback after a shortcut conflict.
+- `python3 scripts/test-configure-reword.py`: read-only preview safety, preserving customized modes/shortcuts, idempotence, legacy/unsupported-app refusal, private backup and rollback after a shortcut conflict.
+- `scripts/check rune_ui`: the simulated macOS selector's choices, main-key preservation, lab/platform visibility, and light/dark `mac-settings-reword` goldens on Linux. Linux renders the processing selector; the existing shortcut recorder itself remains macOS-only.
+
+Executed locally on macOS: `scripts/check` passed all 2,232 non-ignored tests (31 opt-in tests skipped), including strict Clippy, formatting, code-shape and Nix-pin checks. The setup script's eight tests passed. FFmpeg is required for the existing capture-core media tests. The new selector was also rendered and inspected in both appearances on macOS.
 
 Headless previews and unit tests are not proof of a physical shortcut, a real provider rewrite, or a paste into Slack. Those need a smoke test after launching the local build. No test should launch a second microphone listener beside the installed app or rewrite the user's live settings.

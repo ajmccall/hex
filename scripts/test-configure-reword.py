@@ -80,6 +80,20 @@ class ConfigureReword(unittest.TestCase):
         self.assertEqual(cli.call_count, 1)
         self.assertEqual(cli.call_args.args[2], "get")
 
+    def test_preview_never_sets_anything(self):
+        original = self.original()
+        def cli(binary, action, operation, key, *value):
+            self.assertEqual(operation, "get")
+            return {"settings": [{"value": original[key], "available": True}]}
+        with patch.object(module, "cli", cli), patch("sys.argv", ["configure-reword.py", "--shortcut", "f6"]), contextlib.redirect_stdout(io.StringIO()):
+            module.main()
+
+    def test_unsupported_platform_fails_before_any_write(self):
+        with patch.object(module, "cli", return_value={"settings": [{"available": False}]}) as cli, patch("sys.argv", ["configure-reword.py", "--apply"]):
+            with self.assertRaisesRegex(RuntimeError, "macOS"):
+                module.main()
+        self.assertEqual(cli.call_count, 1)
+
     def test_preset_uses_fast_default_model_and_a_deadline(self):
         preset = json.loads((Path(__file__).resolve().parent.parent / "resources/reword-mode.json").read_text())
         self.assertFalse(preset["applications"])

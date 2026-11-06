@@ -847,14 +847,20 @@ const DIFFERENCES: &[(&str, Difference)] = &[
         "modifier_sides",
         Difference::Impossible("X11 grabs and the Wayland portal see no sides"),
     ),
+    (
+        "second_dictation_shortcut",
+        Difference::Pending(
+            "the second dictation shortcut machine is implemented only in the macOS listener",
+        ),
+    ),
 ];
 
 impl Capabilities {
     /// Every capability by name. Destructuring makes a new capability a
     /// compile error here until it is named.
-    pub(super) fn fields(self) -> [(&'static str, bool); 13] {
+    pub(super) fn fields(self) -> [(&'static str, bool); 14] {
         let Self {
-            os: _,
+            os,
             meetings,
             calendar,
             permissions,
@@ -883,6 +889,7 @@ impl Capabilities {
             ("fun", fun),
             ("modifier_sides", modifier_sides),
             ("keyboard_model_switching", keyboard_model_switching),
+            ("second_dictation_shortcut", os == Os::Macos),
         ]
     }
 }

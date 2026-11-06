@@ -6,6 +6,12 @@ use serde::{Deserialize, Serialize};
 use super::TextReplacement;
 use crate::dictation::vocabulary::{VocabularyEntry, serialize_saved};
 
+/// One naming rule for explicit mode references in settings, the UI, and
+/// runtime selection, including the reserved Global name.
+pub(crate) fn mode_names_match(left: &str, right: &str) -> bool {
+    left.trim().to_lowercase() == right.trim().to_lowercase()
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub struct DictationProcessingSettings {
@@ -68,5 +74,30 @@ impl Default for DictationPostProcessing {
             variant: None,
             deadline_seconds: 30,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_names_have_one_case_insensitive_trimmed_comparison() {
+        assert!(mode_names_match(" Reword ", "reword"));
+        assert!(mode_names_match("Équipe", "équipe"));
+        assert!(mode_names_match("Global", " GLOBAL "));
+        assert!(!mode_names_match("Reword", "Reword more"));
+    }
+
+    #[test]
+    fn older_settings_keep_automatic_second_shortcut_processing() {
+        let settings: DictationProcessingSettings = serde_json::from_str("{}").unwrap();
+        assert!(settings.second_shortcut_mode.is_none());
+        assert!(
+            serde_json::to_value(settings)
+                .unwrap()
+                .get("second_shortcut_mode")
+                .is_none()
+        );
     }
 }

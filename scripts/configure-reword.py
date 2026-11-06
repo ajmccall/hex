@@ -58,7 +58,9 @@ def main():
     parser.add_argument("--apply", action="store_true", help="Apply the previewed changes; default is read-only")
     args = parser.parse_args()
     # Check the fork-only key first. An older running Hex must fail before any write.
-    cli(args.hex, "settings", "get", MODE_KEY)
+    setting = cli(args.hex, "settings", "get", MODE_KEY)["settings"][0]
+    if not setting.get("available", True):
+        raise RuntimeError("The Reword shortcut is available only in the macOS fork")
     original = {key: cli(args.hex, "settings", "get", key)["settings"][0]["value"] for key in KEYS}
     preset = json.loads((Path(__file__).resolve().parent.parent / "resources/reword-mode.json").read_text())
     desired = plan(original, preset, args.shortcut)

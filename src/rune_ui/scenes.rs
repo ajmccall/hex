@@ -277,9 +277,15 @@ pub(super) const SCENES: &[Scene] = &[
     }),
     // macOS and Windows surfaces, from preview data (see `platform`).
     ("mac-settings", |ui| *ui = mac_fixture()),
-    #[cfg(target_os = "macos")]
     ("mac-settings-reword", |ui| {
         *ui = mac_fixture();
+        ui.settings.dictation_hotkey = HotkeyBinding {
+            modifiers: crate::app_settings::HotkeyModifiers {
+                function: true,
+                ..Default::default()
+            },
+            key: None,
+        };
         ui.settings.labs.second_dictation_shortcut = true;
         ui.settings
             .dictation_processing

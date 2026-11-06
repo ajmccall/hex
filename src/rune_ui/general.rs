@@ -85,8 +85,10 @@ fn basics(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
         }
         // Labs › Second dictation shortcut (macOS): another key that
         // dictates like the one above, such as on an external keyboard.
-        #[cfg(target_os = "macos")]
-        if crate::labs::Feature::SecondDictationShortcut.on(&ui.settings) {
+        if ui.platform.caps.os == super::platform::Os::Macos
+            && crate::labs::Feature::SecondDictationShortcut.on(&ui.settings)
+        {
+            #[cfg(target_os = "macos")]
             rows.extend(shortcut_rows(
                 ui,
                 p,
