@@ -65,4 +65,10 @@ To disable that shortcut entirely: `hex labs off second-dictation-shortcut`.
 
 Executed locally on macOS: `scripts/check` passed all 2,232 non-ignored tests (31 opt-in tests skipped), including strict Clippy, formatting, code-shape and Nix-pin checks. The setup script's eight tests passed. FFmpeg is required for the existing capture-core media tests. The new selector was also rendered and inspected in both appearances on macOS.
 
+Executed in an isolated Linux ARM64 container with Mesa 25 lavapipe:
+five targeted second-shortcut tests passed, then all 484 `rune_ui` tests
+passed, including existing and new goldens. The two new reference images were
+inspected and committed. No existing goldens were rewritten. Both independent
+review axes (Standards and Spec) found no outstanding issues after follow-up.
+
 Headless previews and unit tests are not proof of a physical shortcut, a real provider rewrite, or a paste into Slack. Those need a smoke test after launching the local build. No test should launch a second microphone listener beside the installed app or rewrite the user's live settings.
