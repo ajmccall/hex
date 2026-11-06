@@ -55,6 +55,8 @@ mod scenes;
 mod scrawl;
 #[cfg(hex_capture)]
 pub(crate) mod screenshot_thumbnail;
+#[cfg(target_os = "macos")]
+mod second_shortcut;
 mod settings;
 mod shortcut_mode;
 mod sidebar;

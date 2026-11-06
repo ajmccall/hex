@@ -249,6 +249,8 @@ struct ContextualProfile {
 pub struct Profiles {
     default: Profile,
     contextual: Vec<ContextualProfile>,
+    /// Includes modes with no app/site rules, for explicit shortcut selection.
+    named: Vec<Profile>,
     /// Global's corrections, run before the selected mode's own on every
     /// dictation, as the Windows and Linux listeners do.
     global: ReplacementSet,
@@ -259,12 +261,18 @@ impl Profiles {
         Self {
             default,
             contextual: Vec::new(),
+            named: Vec::new(),
             global: ReplacementSet::default(),
         }
     }
 
     pub(crate) fn global_replacements(mut self, replacements: ReplacementSet) -> Self {
         self.global = replacements;
+        self
+    }
+
+    pub(crate) fn named(mut self, profile: Profile) -> Self {
+        self.named.push(profile);
         self
     }
 
@@ -291,6 +299,25 @@ impl Profiles {
     }
 
     fn select<'a>(&'a self, context: &ContextSnapshot) -> &'a Profile {
+        if let Some(name) = &context.processing_mode {
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("Global") {
+                return &self.default;
+            }
+            let mut matches = self
+                .named
+                .iter()
+                .filter(|profile| profile.name.trim().eq_ignore_ascii_case(name));
+            // A renamed/deleted or ambiguous mode must not silently run the
+            // foreground app's unrelated rewrite. Keep Global cleanup instead.
+            return match (matches.next(), matches.next()) {
+                (Some(profile), None) => profile,
+                _ => {
+                    tracing::warn!("explicit dictation mode unavailable; using Global");
+                    &self.default
+                }
+            };
+        }
         let selected = self
             .contextual
             .iter()
@@ -1199,6 +1226,7 @@ mod tests {
             browser_url: url.map(|url| Url::parse(url).unwrap()),
             window_title: None,
             input_revision: None,
+            processing_mode: None,
         }
     }
 

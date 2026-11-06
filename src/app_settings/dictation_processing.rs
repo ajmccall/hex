@@ -11,6 +11,10 @@ use crate::dictation::vocabulary::{VocabularyEntry, serialize_saved};
 pub struct DictationProcessingSettings {
     pub default_mode: DictationMode,
     pub modes: Vec<DictationMode>,
+    /// An explicit mode for Labs › Second dictation shortcut (macOS).
+    /// None keeps automatic app/site selection; Global selects Global alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_shortcut_mode: Option<String>,
 }
 
 impl Default for DictationProcessingSettings {
@@ -21,6 +25,7 @@ impl Default for DictationProcessingSettings {
                 ..Default::default()
             },
             modes: Vec::new(),
+            second_shortcut_mode: None,
         }
     }
 }

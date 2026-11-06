@@ -428,6 +428,13 @@ observe input-source changes or show these controls.
   a key on an external keyboard. It acts only while
   `labs.second_dictation_shortcut` is on (`hex labs on
   second-dictation-shortcut`) and shares no key with another shortcut.
+- `dictation_processing.second_shortcut_mode` (personal macOS fork) selects a
+  named mode for Labs › Second dictation shortcut, even without app/site rules.
+  `none` keeps automatic selection (default); `Global` ignores contextual modes.
+  Global replacements and the Remove filler words lab still run first. The
+  initiating shortcut latches the name; a missing/ambiguous saved name falls
+  back to Global. `settings set` rejects missing/ambiguous names. The main and
+  raw shortcuts are unchanged. See [Reword setup](personal-reword.md).
 - `json` settings (modes, meeting providers, excluded calendars) take the JSON
   value the file stores.
 - `ui_language` takes `en`, `pl`, `zh` (Simplified Chinese), `zh-Hant`
@@ -471,6 +478,7 @@ Writable keys: `release_microphone_while_idle`,
 `shortcut_mode`, `dictation_hotkey`, `paste_last_hotkey`, `raw_dictation_hotkey`,
 `second_dictation_hotkey`, `labs.second_dictation_shortcut`, `labs.standalone_special_keys`, `show_dock_icon`, `vocabulary_boost`,
 `dictation_processing.default_mode`, `dictation_processing.modes`,
+`dictation_processing.second_shortcut_mode`,
 `history_retention`, `meetings.enabled`,
 `meetings.output_folder`, `meetings.summaries`, `meetings.opencode_model`,
 `meetings.show_recording_indicator`, `meetings.recording_indicator_corner`,

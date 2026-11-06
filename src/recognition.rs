@@ -147,9 +147,28 @@ struct Hotkeys {
     /// The recording (or the last) skips processing: the raw shortcut or
     /// `hex dictation start --raw` started it.
     raw_capture: bool,
+    /// Latched at start, carried to the queued job even if settings or the
+    /// foreground app change before release. Normal/raw starts clear it.
+    mode_capture: Option<String>,
 }
 
 impl Hotkeys {
+    fn start_processing(&mut self, shortcut: Shortcut, second_mode: Option<String>) {
+        self.raw_capture = shortcut == Shortcut::Raw;
+        self.mode_capture = if shortcut == Shortcut::Second {
+            second_mode
+        } else {
+            None
+        };
+    }
+
+    fn context(&self, context: &ContextSnapshot) -> ContextSnapshot {
+        ContextSnapshot {
+            processing_mode: self.mode_capture.clone(),
+            ..context.clone()
+        }
+    }
+
     fn machines(&mut self) -> impl Iterator<Item = &mut DictationHotkey> {
         std::iter::once(&mut self.dictation)
             .chain(self.second.as_mut())
@@ -336,6 +355,7 @@ pub fn listen(
         second: None,
         raw: None,
         raw_capture: false,
+        mode_capture: None,
     };
     hotkeys.configure(CaptureInstant::now());
     let recording_environment = RecordingEnvironmentController::start();
@@ -496,6 +516,7 @@ pub fn listen(
                         next_programmatic_id = next_programmatic_id.wrapping_add(1).max(1);
                         let boundary =
                             capture_boundary(&input, microphone_policy.release_while_idle);
+                        crate::dictation::vocabulary::focus(&context);
                         match input.start_programmatic(boundary) {
                             Ok(()) => {
                                 hotkeys.disarm_pending_gestures();
@@ -780,7 +801,12 @@ pub fn listen(
             }
             let switched_app = context.application != next_context.application;
             context = next_context;
-            crate::dictation::vocabulary::focus(&context);
+            let hearing_context = if hotkeys.any_recording() {
+                hotkeys.context(&context)
+            } else {
+                context.clone()
+            };
+            crate::dictation::vocabulary::focus(&hearing_context);
             if switched_app {
                 events.emit(&VoiceEvent::Context {
                     timestamp_ms: now_ms(),
@@ -905,15 +931,19 @@ pub fn listen(
             }
             for (shortcut, action) in hotkeys.process(input_event, capture_at) {
                 if action == HotkeyAction::Start {
-                    hotkeys.raw_capture = shortcut == Shortcut::Raw;
+                    hotkeys.start_processing(
+                        shortcut,
+                        crate::dictation::config::second_shortcut_mode(),
+                    );
                 }
+                let capture_context = hotkeys.context(&context);
                 let accepted = handle_hotkey_action(
                     action,
                     hotkeys.raw_capture,
                     capture_at,
                     &input,
                     &dictation_worker,
-                    &context,
+                    &capture_context,
                     &input.device_name(),
                     &mut events,
                     indicator.as_ref(),
@@ -1255,6 +1285,7 @@ fn handle_hotkey_action(
 ) -> Result<bool> {
     match action {
         HotkeyAction::Start => {
+            crate::dictation::vocabulary::focus(context);
             if !dictation.start(action_at)? {
                 return Ok(false);
             }
@@ -1480,7 +1511,14 @@ fn control_dictation(
                     "the dictation shortcut is held; release it and try again",
                 ));
             }
-            hotkeys.raw_capture = raw;
+            hotkeys.start_processing(
+                if raw {
+                    Shortcut::Raw
+                } else {
+                    Shortcut::Dictation
+                },
+                None,
+            );
             let accepted = handle_hotkey_action(
                 HotkeyAction::Start,
                 raw,
@@ -1514,7 +1552,7 @@ fn control_dictation(
                 capture_boundary(input, release_while_idle),
                 input,
                 worker,
-                context,
+                &hotkeys.context(context),
                 &device,
                 events,
                 indicator,
@@ -1868,6 +1906,7 @@ mod tests {
             second: Some(DictationHotkey::new(base, true, control)),
             raw: None,
             raw_capture: false,
+            mode_capture: None,
         };
         let mut press = |flags: u64, ms: u64| hotkeys.process(InputEvent::Flags(flags), at(ms));
         const START: HotkeyAction = HotkeyAction::Start;
@@ -1897,6 +1936,38 @@ mod tests {
         assert_eq!(press(OPTION_KEY_MASK, 7_000), [(DICTATION, FINISH)]);
         assert!(press(0, 7_100).is_empty());
         assert!(!hotkeys.any_recording());
+    }
+
+    #[test]
+    fn second_shortcut_latches_its_mode_and_other_starts_clear_it() {
+        let mut hotkeys = Hotkeys {
+            dictation: DictationHotkey::new(
+                CaptureInstant::now(),
+                false,
+                crate::app_settings::RuntimeHotkey::default(),
+            ),
+            second: None,
+            raw: None,
+            raw_capture: false,
+            mode_capture: None,
+        };
+        let foreground = ContextSnapshot {
+            application: Some("Slack".into()),
+            ..ContextSnapshot::default()
+        };
+        hotkeys.start_processing(Shortcut::Second, Some("Reword".into()));
+        let queued = hotkeys.context(&foreground);
+        assert_eq!(queued.processing_mode.as_deref(), Some("Reword"));
+        assert!(!hotkeys.raw_capture);
+        hotkeys.start_processing(Shortcut::Dictation, Some("Something else".into()));
+        assert!(hotkeys.context(&foreground).processing_mode.is_none());
+        hotkeys.start_processing(Shortcut::Raw, Some("Reword".into()));
+        assert!(hotkeys.raw_capture);
+        assert!(hotkeys.context(&foreground).processing_mode.is_none());
+        assert_eq!(queued.processing_mode.as_deref(), Some("Reword"));
+        hotkeys.start_processing(Shortcut::Second, None);
+        assert!(!hotkeys.raw_capture);
+        assert!(hotkeys.context(&foreground).processing_mode.is_none());
     }
 
     #[test]

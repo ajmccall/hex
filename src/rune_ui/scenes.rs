@@ -277,6 +277,23 @@ pub(super) const SCENES: &[Scene] = &[
     }),
     // macOS and Windows surfaces, from preview data (see `platform`).
     ("mac-settings", |ui| *ui = mac_fixture()),
+    #[cfg(target_os = "macos")]
+    ("mac-settings-reword", |ui| {
+        *ui = mac_fixture();
+        ui.settings.labs.second_dictation_shortcut = true;
+        ui.settings
+            .dictation_processing
+            .modes
+            .push(serde_json::from_str(include_str!("../../resources/reword-mode.json")).unwrap());
+        ui.settings.dictation_processing.second_shortcut_mode = Some("Reword".into());
+        ui.settings.second_dictation_hotkey = Some(HotkeyBinding {
+            modifiers: crate::app_settings::HotkeyModifiers::option(),
+            key: Some(crate::app_settings::HotkeyKey {
+                code: 49,
+                label: "Space".into(),
+            }),
+        });
+    }),
     // The microphone row following a recorded voice (`--video`), and with
     // the microphone released while idle, when no audio arrives.
     ("mac-settings-mic-level", |ui| {

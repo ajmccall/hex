@@ -94,8 +94,9 @@ fn basics(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
                 &KEYBOARD,
                 tr("Second dictation shortcut"),
                 ShortcutTarget::SecondDictation,
-                Some(tr("Dictates like the shortcut above")),
+                None,
             ));
+            rows.push(super::second_shortcut::processing_row(ui, p, layer));
         }
         // Annotate's shortcut beside dictation's on Linux, where the desktop
         // lists both and a lone F9 is otherwise easy to miss (#723).
