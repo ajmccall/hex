@@ -115,7 +115,7 @@ const FIRST_FRAME: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl HudSender {
     pub(crate) fn send(&self, event: HudEvent) {
-        if matches!(&event, HudEvent::Started) {
+        if matches!(&event, HudEvent::Started | HudEvent::StartedWithMode(_)) {
             self.recording.store(true, Ordering::Release);
         } else if matches!(
             &event,
@@ -128,7 +128,7 @@ impl HudSender {
             self.recording.store(false, Ordering::Release);
         }
         match &event {
-            HudEvent::Started => {
+            HudEvent::Started | HudEvent::StartedWithMode(_) => {
                 crate::rune_ui::live_text::capture_started();
             }
             HudEvent::Failed {
@@ -143,7 +143,7 @@ impl HudSender {
             _ => {}
         }
         #[cfg(target_os = "windows")]
-        if matches!(&event, HudEvent::Started) {
+        if matches!(&event, HudEvent::Started | HudEvent::StartedWithMode(_)) {
             let presents = self.overlay.surface_stats().totals.presents;
             let mut watch = self.watch.lock().unwrap_or_else(|error| error.into_inner());
             if watch.position != IndicatorPosition::Hidden && watch.pending.is_none() {
@@ -238,6 +238,9 @@ pub(crate) struct Hud {
     /// show or hide, so the pump's macOS Space check guards on the panel's
     /// `isVisible` for that gap.
     shown: Arc<AtomicBool>,
+    /// Last published badge and placement; metering never queues UI work.
+    mode_badge: Option<String>,
+    mode_spot: Option<Spot>,
     /// Rune's Reduce Motion, as of the last frame.
     reduce: bool,
     /// Whether the compositor wants the display's frames.
@@ -285,16 +288,16 @@ impl Hud {
         // A capture's start sends the display and placement to Rune again,
         // so a placement Rune resolved wrong on another screen (#873)
         // doesn't stick.
+        let starts = matches!(&event, HudEvent::Started | HudEvent::StartedWithMode(_));
+        let meter = matches!(&event, HudEvent::Meter { .. });
         #[cfg(target_os = "macos")]
-        if matches!(&event, HudEvent::ConfigureDotScope(_) | HudEvent::Started) {
+        if starts || matches!(&event, HudEvent::ConfigureDotScope(_)) {
             self.placed = None;
         }
         #[cfg(not(target_os = "macos"))]
-        if matches!(&event, HudEvent::Started) {
+        if starts {
             self.edge_placed = None;
         }
-        let starts = matches!(&event, HudEvent::Started);
-        let meter = matches!(&event, HudEvent::Meter { .. });
         self.model.handle(event, Instant::now(), self.reduce);
         self.animating.store(true, Ordering::Release);
         if starts || (self.shown.load(Ordering::Acquire) && !meter) {
@@ -353,6 +356,22 @@ impl Hud {
             overlay.show();
             self.shown.store(true, Ordering::Release);
         }
+        self.sync_mode_badge();
+    }
+
+    fn sync_mode_badge(&mut self) {
+        let mode = self
+            .shown
+            .load(Ordering::Acquire)
+            .then(|| self.model.mode_badge())
+            .flatten();
+        let spot = live_text_place();
+        if self.mode_badge.as_deref() != mode || (mode.is_some() && self.mode_spot != Some(spot)) {
+            let mode = mode.map(str::to_owned);
+            crate::rune_ui::live_text::set_mode(mode.clone(), spot);
+            self.mode_badge = mode;
+            self.mode_spot = Some(spot);
+        }
     }
 
     /// Hides the overlay once its exit has settled, fading the window out
@@ -371,6 +390,7 @@ impl Hud {
             #[cfg(not(target_os = "macos"))]
             release_painter(&self.gpu);
         }
+        self.sync_mode_badge();
     }
 
     fn hide(&mut self) {
@@ -382,6 +402,7 @@ impl Hud {
             #[cfg(not(target_os = "macos"))]
             release_painter(&self.gpu);
         }
+        self.sync_mode_badge();
     }
 
     /// The next show places the overlay again.
@@ -513,6 +534,8 @@ pub(crate) fn install<S: 'static>(app: &mut rune::App<S>) -> HudSender {
             position: IndicatorPosition::Top,
             this: None,
             shown: shown.clone(),
+            mode_badge: None,
+            mode_spot: None,
             reduce: false,
             animating: animating.clone(),
             #[cfg(target_os = "macos")]

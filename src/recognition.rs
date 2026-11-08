@@ -232,6 +232,7 @@ pub fn listen(
         .flatten();
     let mut next_programmatic_id = 1_u64;
     let mut programmatic = None::<ProgrammaticDictation>;
+    let mut programmatic_indicator_recording = false;
     let mut programmatic_lost = None::<LostProgrammaticDictation>;
     let mut programmatic_results =
         BTreeMap::<crate::parakeet::DictationJobId, FinishingProgrammaticDictation>::new();
@@ -291,6 +292,7 @@ pub fn listen(
             handle_hotkey_action(
                 HotkeyAction::Cancel,
                 false,
+                None,
                 input.captured_through(),
                 &input,
                 &dictation_worker,
@@ -692,6 +694,7 @@ pub fn listen(
             handle_hotkey_action(
                 HotkeyAction::Cancel,
                 false,
+                None,
                 input.captured_through(),
                 &input,
                 &dictation_worker,
@@ -717,6 +720,7 @@ pub fn listen(
             handle_hotkey_action(
                 HotkeyAction::Cancel,
                 false,
+                None,
                 input.captured_through(),
                 &input,
                 &dictation_worker,
@@ -754,6 +758,7 @@ pub fn listen(
             let accepted = handle_hotkey_action(
                 action,
                 hotkeys.raw_capture,
+                None,
                 at,
                 &input,
                 &dictation_worker,
@@ -843,6 +848,7 @@ pub fn listen(
                 let accepted = handle_hotkey_action(
                     action,
                     hotkeys.raw_capture,
+                    hotkeys.indicator_mode(shortcut),
                     capture_at,
                     &input,
                     &dictation_worker,
@@ -1057,6 +1063,14 @@ pub fn listen(
             }
         }
 
+        // Observe silent API captures after controls, lease expiry, and audio
+        // failures so a pending badge returns as soon as one ends.
+        sync_programmatic_indicator(
+            programmatic.is_some(),
+            &mut programmatic_indicator_recording,
+            indicator,
+        );
+
         // Every chunk already queued, not one per pass: a pass can take
         // longer than a chunk lasts, and a backlog that overflows leaves the
         // meter only stale audio.
@@ -1104,8 +1118,21 @@ pub fn listen(
         device: input.device_name(),
     })?;
     events.flush()?;
+    sync_programmatic_indicator(false, &mut programmatic_indicator_recording, indicator);
     indicator.send(DictationIndicatorEvent::Discarded);
     Ok(())
+}
+
+fn sync_programmatic_indicator(
+    recording: bool,
+    previous: &mut bool,
+    indicator: DictationSink<'_>,
+) {
+    if recording == *previous {
+        return;
+    }
+    *previous = recording;
+    indicator.send(DictationIndicatorEvent::ProgrammaticRecording { recording });
 }
 
 fn log_programmatic_ended(active: Option<ProgrammaticDictation>, outcome: &str) {
@@ -1199,6 +1226,7 @@ fn cancel_programmatic_capture(
 fn handle_hotkey_action(
     action: HotkeyAction,
     raw: bool,
+    mode: Option<&str>,
     action_at: CaptureInstant,
     dictation: &DictationAudio,
     worker: &DictationWorker,
@@ -1230,7 +1258,9 @@ fn handle_hotkey_action(
             #[cfg(hex_capture)]
             crate::screenshots::narration::started();
             events.dictation(DictationPhase::Started, "")?;
-            indicator.send(DictationIndicatorEvent::Started);
+            indicator.send(mode.map_or(DictationIndicatorEvent::Started, |name| {
+                DictationIndicatorEvent::StartedWithMode(name.to_owned())
+            }));
             emit_state(events, true, device)
         }
         HotkeyAction::Finish => {
@@ -1404,6 +1434,7 @@ fn control_dictation(
             handle_hotkey_action(
                 HotkeyAction::CancelShortcut,
                 false,
+                None,
                 input.captured_through(),
                 input,
                 worker,
@@ -1441,6 +1472,7 @@ fn control_dictation(
             let accepted = handle_hotkey_action(
                 HotkeyAction::Start,
                 raw,
+                None,
                 capture_boundary(input, release_while_idle),
                 input,
                 worker,

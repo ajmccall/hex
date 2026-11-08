@@ -73,6 +73,8 @@ Dictation HUD (click-through overlay)         // a11y.hud
 ├── A status, polite live region, described "Dictation"
 ├── Recording -> named "Recording"; Transcribing -> "Transcribing"; a failure -> "Failed"
 │   └── The name changing is what screen readers announce
+├── Secondary shortcut (personal macOS fork) -> Mode badge in the existing live-text plate
+│   └── A separate polite status names the latched mode, described as Second dictation shortcut
 └── Hidden or fading -> no name; the overlay takes no input or focus
 
 Meeting capsules                              // a11y.capsules

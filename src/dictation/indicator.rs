@@ -6,7 +6,7 @@
 //! Time is passed in, never read, so a recorded schedule replays exactly
 //! (`rune_hud`'s frame captures).
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::rune_hud::dot_scope::{self, Pose, Scope, Stage, Tuning};
@@ -35,6 +35,12 @@ pub enum DictationIndicatorEvent {
     /// until the next `Reset`.
     DemoVoice,
     Started,
+    /// An explicitly selected secondary-shortcut mode, latched at start.
+    StartedWithMode(String),
+    /// Silent API capture masks older job labels without starting a HUD.
+    ProgrammaticRecording {
+        recording: bool,
+    },
     Meter {
         average: f32,
         // Dot scope follows `average`; the window's meters read
@@ -217,7 +223,9 @@ fn fill_island(tuning: Tuning, island: Option<Island>) -> Tuning {
 pub struct IndicatorModel {
     phase: Phase,
     capturing: bool,
-    jobs: BTreeSet<u64>,
+    jobs: BTreeMap<u64, Option<String>>,
+    recording_mode: Option<String>,
+    programmatic_recording: bool,
     phase_started: Instant,
     /// When the processing look began, for [`PROCESSING_MIN_DURATION`].
     working_since: Instant,
@@ -243,7 +251,9 @@ impl IndicatorModel {
         Self {
             phase: Phase::Hidden,
             capturing: false,
-            jobs: BTreeSet::new(),
+            jobs: BTreeMap::new(),
+            recording_mode: None,
+            programmatic_recording: false,
             phase_started: now,
             working_since: now,
             completion_pending: false,
@@ -275,6 +285,20 @@ impl IndicatorModel {
         }
     }
 
+    /// The capture in front wins; otherwise the oldest pending job owns the
+    /// badge. A silent programmatic capture masks badges without showing HUD.
+    pub fn mode_badge(&self) -> Option<&str> {
+        if self.capturing {
+            self.recording_mode.as_deref()
+        } else if self.programmatic_recording {
+            None
+        } else {
+            self.jobs
+                .first_key_value()
+                .and_then(|(_, mode)| mode.as_deref())
+        }
+    }
+
     /// Dot scope's tuning, as set.
     #[cfg(target_os = "macos")]
     pub fn tuning(&self) -> Tuning {
@@ -295,6 +319,8 @@ impl IndicatorModel {
         match event {
             DictationIndicatorEvent::Reset => {
                 self.capturing = false;
+                self.recording_mode = None;
+                self.programmatic_recording = false;
                 self.jobs.clear();
                 self.phase = Phase::Hidden;
                 self.completion_pending = false;
@@ -308,28 +334,27 @@ impl IndicatorModel {
             DictationIndicatorEvent::DemoVoice => {
                 self.demo_voice = Some(0.0);
             }
-            DictationIndicatorEvent::Started => {
-                // HUD Lab and the playground send `DemoVoice` after this.
-                self.demo_voice = None;
-                self.capturing = true;
-                self.phase = Phase::Recording;
-                self.phase_started = now;
-                self.completion_pending = false;
-                self.loudness = SILENT;
-                self.stage = Stage::Recording;
-                self.scope.restart(reduce);
+            DictationIndicatorEvent::Started => self.start_capture(None, now, reduce),
+            DictationIndicatorEvent::StartedWithMode(name) => {
+                self.start_capture(Some(name), now, reduce);
+            }
+            DictationIndicatorEvent::ProgrammaticRecording { recording } => {
+                self.programmatic_recording = recording;
             }
             DictationIndicatorEvent::Meter { average, .. } => {
                 self.loudness = dot_scope::loudness(average);
             }
             DictationIndicatorEvent::Submitted { job_id } => {
+                if self.jobs.contains_key(&job_id) {
+                    return;
+                }
                 self.capturing = false;
-                self.jobs.insert(job_id);
+                self.jobs.insert(job_id, self.recording_mode.take());
                 self.show_pipeline(now);
             }
             DictationIndicatorEvent::Transcribing { job_id }
             | DictationIndicatorEvent::Processing { job_id } => {
-                if self.jobs.contains(&job_id) {
+                if self.jobs.contains_key(&job_id) {
                     self.show_pipeline(now);
                 }
             }
@@ -354,8 +379,23 @@ impl IndicatorModel {
         }
     }
 
+    fn start_capture(&mut self, mode: Option<String>, now: Instant, reduce: bool) {
+        // HUD Lab and the playground send `DemoVoice` after this.
+        self.demo_voice = None;
+        self.capturing = true;
+        self.recording_mode = mode;
+        self.programmatic_recording = false;
+        self.phase = Phase::Recording;
+        self.phase_started = now;
+        self.completion_pending = false;
+        self.loudness = SILENT;
+        self.stage = Stage::Recording;
+        self.scope.restart(reduce);
+    }
+
     fn finish_capture(&mut self, now: Instant, empty_phase: Phase) {
         self.capturing = false;
+        self.recording_mode = None;
         if !matches!(empty_phase, Phase::Hidden) {
             self.phase_started = now;
         }
@@ -383,7 +423,7 @@ impl IndicatorModel {
     }
 
     fn finish_job(&mut self, job_id: u64, now: Instant, terminal: Phase) {
-        if !self.jobs.remove(&job_id) {
+        if self.jobs.remove(&job_id).is_none() {
             return;
         }
         if active_phase(self.capturing, self.jobs.len()).is_some() {

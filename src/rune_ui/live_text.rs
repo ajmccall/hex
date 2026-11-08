@@ -16,11 +16,12 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rune::{
-    Anim, Cx, El, OverlayHandle, OverlayOptions, OverlayPlacement, OverlaySpec, ScreenEdge, row,
-    text,
+    Anim, Cx, El, LiveRegion, OverlayHandle, OverlayOptions, OverlayPlacement, OverlaySpec,
+    ScreenEdge, row, text,
 };
 
 use super::controls::Paint;
+use crate::desktop::i18n::tr;
 use crate::transcription::engine::Partial;
 
 /// The overlay's size: room for about a dozen words on one line.
@@ -39,6 +40,8 @@ pub(crate) struct Plate {
     /// Labs › Failure notices: why the last dictation failed, shown instead
     /// of the live words while it lasts.
     failure: Option<String>,
+    /// A mode selected by the secondary shortcut, kept through processing.
+    mode: Option<String>,
     /// Whether live words are being published (a recording is showing text).
     live: bool,
     /// Whether the overlay is on screen. Every change happens in an overlay
@@ -71,9 +74,9 @@ impl Plate {
         self.shown = shown;
     }
 
-    /// Nothing live or failed remains to justify the plate.
+    /// Nothing live, failed, or explicitly selected remains to justify the plate.
     fn should_hide(&self) -> bool {
-        !self.live && self.failure.is_none()
+        !self.live && self.failure.is_none() && self.mode.is_none()
     }
 }
 
@@ -295,6 +298,28 @@ pub(crate) fn show_failure(message: &str) {
     });
 }
 
+/// The HUD publishes a latched mode independently of optional live text.
+/// Both updates run through the plate's queue, so a word release cannot hide
+/// a badge while its selected processing mode is still running.
+pub(crate) fn set_mode(mode: Option<String>, spot: Spot) {
+    let Some(overlay) = LIVE.get() else {
+        return;
+    };
+    let handle = overlay.clone();
+    overlay.update(move |plate, tx| {
+        plate.mode = mode;
+        tx.instant();
+        if !plate.should_hide() && !plate.shown {
+            spot.apply(&handle);
+            handle.show();
+            plate.mark_shown(true);
+        } else if plate.should_hide() && plate.shown {
+            handle.fade_out(FADE);
+            plate.mark_shown(false);
+        }
+    });
+}
+
 /// Hides a failure notice at once when a new capture starts; live words
 /// already on the plate stay.
 pub(crate) fn capture_started() {
@@ -447,9 +472,29 @@ fn view(plate_state: &Plate, cx: &mut Cx<Plate>) -> El {
             .color(p.danger());
         return root.child(plate(&p, line));
     }
-    if plate_state.stable.trim().is_empty() && plate_state.tentative.trim().is_empty() {
+    if plate_state.mode.is_none()
+        && plate_state.stable.trim().is_empty()
+        && plate_state.tentative.trim().is_empty()
+    {
         return root;
     }
+    let root = if let Some(mode) = &plate_state.mode {
+        root.role("status")
+            .label(tr(mode).to_owned())
+            .description(tr("Second dictation shortcut"))
+            .live_region(LiveRegion::Polite)
+    } else {
+        root
+    };
+    let mode = plate_state.mode.as_ref().map(|name| {
+        text(tr(name).to_owned())
+            .key("mode-badge")
+            .font(p.k.ty.ui)
+            .color(p.accent())
+            .max_w(180.0)
+            .max_lines(1)
+            .truncate()
+    });
     // The newest words stay in view: the start gives way with "…".
     let stable = text(plate_state.stable.trim().to_owned())
         .key("stable")
@@ -482,7 +527,13 @@ fn view(plate_state: &Plate, cx: &mut Cx<Plate>) -> El {
     } else {
         line.child(stable).children(tentative)
     };
-    root.child(plate(&p, line))
+    root.child(plate(
+        &p,
+        row()
+            .gap(8.0)
+            .children(mode)
+            .children((!plate_state.stable.trim().is_empty() || !plate_state.tentative.trim().is_empty()).then_some(line)),
+    ))
 }
 
 #[cfg(test)]

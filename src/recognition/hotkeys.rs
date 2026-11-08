@@ -90,6 +90,16 @@ impl Hotkeys {
         self.mode_capture.clone()
     }
 
+    /// The secondary shortcut identifies itself in the HUD even when its
+    /// processing setting is Automatic.
+    pub(super) fn indicator_mode(&self, shortcut: Shortcut) -> Option<&str> {
+        (shortcut == Shortcut::Second).then(|| {
+            self.mode_capture
+                .as_deref()
+                .unwrap_or("Second dictation shortcut")
+        })
+    }
+
     /// The fixed shortcuts' machines, in matching order. The extra rows have
     /// their own trigger modes and are configured separately.
     fn fixed_machines(&mut self) -> impl Iterator<Item = &mut DictationHotkey> {
