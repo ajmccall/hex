@@ -2551,13 +2551,18 @@ fn check_golden(scene: &str, dark: bool, size: (f32, f32)) {
         eprintln!("skipping golden {name}: no GPU adapter");
         return;
     };
+    check_golden_pixels(&name, width, height, pixels);
+}
+
+/// Shared with the click-through mode/live-text plate's fixture renders.
+pub(super) fn check_golden_pixels(name: &str, width: u32, height: u32, pixels: Vec<u8>) {
     if let Some(folder) = std::env::var_os("HEX_GOLDEN_RENDERS") {
         let folder = std::path::PathBuf::from(folder);
         std::fs::create_dir_all(&folder).unwrap();
         rune::render::write_png(&folder.join(format!("{name}.png")), width, height, &pixels)
             .unwrap();
     }
-    let path = golden_path(&name);
+    let path = golden_path(name);
     if std::env::var_os("HEX_UPDATE_GOLDENS").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         rune::render::write_png(&path, width, height, &pixels).unwrap();

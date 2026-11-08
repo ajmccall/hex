@@ -131,8 +131,8 @@ impl Hud {
             Beat::Fail => &[Event::JobFailed { job_id: JOB }],
             Beat::Leave => &[Event::Cancelled, Event::JobCancelled { job_id: JOB }],
         };
-        for &event in events {
-            self.model.handle(event, now, false);
+        for event in events {
+            self.model.handle(event.clone(), now, false);
         }
     }
 

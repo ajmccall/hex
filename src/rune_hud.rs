@@ -106,7 +106,7 @@ const FIRST_FRAME: std::time::Duration = std::time::Duration::from_millis(1500);
 impl HudSender {
     pub(crate) fn send(&self, event: HudEvent) {
         #[cfg(target_os = "windows")]
-        if matches!(event, HudEvent::Started) {
+        if matches!(event, HudEvent::Started | HudEvent::StartedWithMode(_)) {
             let presents = self.overlay.surface_stats().totals.presents;
             let mut watch = self.watch.lock().unwrap_or_else(|error| error.into_inner());
             if watch.position != IndicatorPosition::Hidden && watch.pending.is_none() {
@@ -198,6 +198,9 @@ pub(crate) struct Hud {
     /// The overlay itself, to show and hide it.
     this: Option<OverlayHandle<Hud>>,
     shown: bool,
+    /// Last published badge and placement; metering never queues UI work.
+    mode_badge: Option<String>,
+    mode_spot: Option<Spot>,
     /// Rune's Reduce Motion, as of the last frame.
     reduce: bool,
     /// Whether the compositor wants the display's frames.
@@ -239,18 +242,19 @@ impl Hud {
         // A capture's start sends the display and placement to Rune again,
         // so a placement Rune resolved wrong on another screen (#873)
         // doesn't stick.
+        let starts = matches!(&event, HudEvent::Started | HudEvent::StartedWithMode(_));
+        let meter = matches!(&event, HudEvent::Meter { .. });
         #[cfg(target_os = "macos")]
-        if let HudEvent::ConfigureDotScope(_) | HudEvent::Started = event {
+        if starts || matches!(&event, HudEvent::ConfigureDotScope(_)) {
             self.placed = None;
         }
         #[cfg(not(target_os = "macos"))]
-        if let HudEvent::Started = event {
+        if starts {
             self.edge_placed = None;
         }
         self.model.handle(event, Instant::now(), self.reduce);
         self.animating.store(true, Ordering::Release);
-        let starts = matches!(event, HudEvent::Started);
-        if starts || (self.shown && !matches!(event, HudEvent::Meter { .. })) {
+        if starts || (self.shown && !meter) {
             self.show();
         }
     }
@@ -306,6 +310,22 @@ impl Hud {
             overlay.show();
             self.shown = true;
         }
+        self.sync_mode_badge();
+    }
+
+    fn sync_mode_badge(&mut self) {
+        let mode = if self.shown {
+            self.model.mode_badge()
+        } else {
+            None
+        };
+        let spot = live_text_place();
+        if self.mode_badge.as_deref() != mode || (mode.is_some() && self.mode_spot != Some(spot)) {
+            let mode = mode.map(str::to_owned);
+            crate::rune_ui::live_text::set_mode(mode.clone(), spot);
+            self.mode_badge = mode;
+            self.mode_spot = Some(spot);
+        }
     }
 
     /// Hides the overlay once its exit has settled, fading the window out
@@ -322,6 +342,7 @@ impl Hud {
             #[cfg(not(target_os = "windows"))]
             overlay.hide();
         }
+        self.sync_mode_badge();
     }
 
     fn hide(&mut self) {
@@ -331,6 +352,7 @@ impl Hud {
         {
             overlay.hide();
         }
+        self.sync_mode_badge();
     }
 
     /// The next show places the overlay again.
@@ -443,6 +465,8 @@ pub(crate) fn install<S: 'static>(app: &mut rune::App<S>) -> HudSender {
             position: IndicatorPosition::Top,
             this: None,
             shown: false,
+            mode_badge: None,
+            mode_spot: None,
             reduce: false,
             animating: animating.clone(),
             #[cfg(target_os = "macos")]

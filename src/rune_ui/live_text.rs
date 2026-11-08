@@ -8,16 +8,15 @@
 //! it before a reveal, so it never reappears with the last dictation's
 //! words for a frame.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rune::{
-    Anim, Cx, El, OverlayHandle, OverlayOptions, OverlayPlacement, OverlaySpec, ScreenEdge, row,
-    text,
+    Anim, Cx, El, LiveRegion, OverlayHandle, OverlayOptions, OverlayPlacement, OverlaySpec,
+    ScreenEdge, row, text,
 };
 
 use super::controls::Paint;
+use crate::desktop::i18n::tr;
 use crate::transcription::engine::Partial;
 
 /// The overlay's size: room for about a dozen words on one line.
@@ -31,6 +30,41 @@ const PAD: f32 = (SIZE.1 - PLATE_H) / 2.0;
 pub(crate) struct Plate {
     stable: String,
     tentative: String,
+    mode: Option<String>,
+    shown: bool,
+    spot: Option<Spot>,
+}
+
+impl Plate {
+    fn has_words(&self) -> bool {
+        !self.stable.trim().is_empty() || !self.tentative.trim().is_empty()
+    }
+
+    fn visible(&self) -> bool {
+        self.mode.is_some() || self.has_words()
+    }
+
+    fn set_partial(&mut self, partial: Option<Partial>) {
+        let partial = partial.unwrap_or_default();
+        self.stable = partial.stable;
+        self.tentative = partial.tentative;
+    }
+
+    fn sync(&mut self, overlay: &OverlayHandle<Plate>, spot: Spot) {
+        if self.visible() {
+            if !self.shown || self.spot != Some(spot) {
+                spot.apply(overlay);
+                self.spot = Some(spot);
+            }
+            if !self.shown {
+                overlay.show();
+            }
+            self.shown = true;
+        } else if self.shown {
+            overlay.fade_out(FADE);
+            self.shown = false;
+        }
+    }
 }
 
 /// Where the plate starts, just past the HUD.
@@ -124,33 +158,29 @@ pub(crate) fn install<S: 'static>(app: &mut rune::App<S>, place: Place) {
     .release_gpu_when_hidden();
     let overlay = app.overlay(spec, Plate::default());
     let _ = LIVE.set(overlay.clone());
-    let shown = Arc::new(AtomicBool::new(false));
     crate::dictation::live_text::watch(move |partial| {
-        let partial = partial.filter(|partial| !is_blank(partial));
-        let Some(Partial { stable, tentative }) = partial.cloned() else {
-            if shown.swap(false, Ordering::AcqRel) {
-                // Hidden from the same queue that shows it, so a recording
-                // that ends as its plate appears never leaves it showing.
-                // Its last words stay while it fades (macOS and Windows);
-                // the next appearance replaces them first.
-                let handle = overlay.clone();
-                overlay.update(move |_, _| handle.fade_out(FADE));
-            }
-            return;
-        };
-        let appearing = !shown.swap(true, Ordering::AcqRel);
+        let partial = partial.filter(|partial| !is_blank(partial)).cloned();
         let handle = overlay.clone();
         overlay.update(move |plate, tx| {
-            plate.stable = stable;
-            plate.tentative = tentative;
+            plate.set_partial(partial);
             tx.instant();
-            if appearing {
-                // Placed and shown after the new words, so it appears
-                // where it belongs with them already drawn.
-                place().apply(&handle);
-                handle.show();
-            }
+            plate.sync(&handle, place());
         });
+    });
+}
+
+/// The HUD publishes a latched mode separately from optional live words.
+/// Both updates use the same overlay queue, so clearing live text at release
+/// cannot hide the mode while its rewrite is still processing.
+pub(crate) fn set_mode(mode: Option<String>, spot: Spot) {
+    let Some(overlay) = LIVE.get() else {
+        return;
+    };
+    let handle = overlay.clone();
+    overlay.update(move |plate, tx| {
+        plate.mode = mode;
+        tx.instant();
+        plate.sync(&handle, spot);
     });
 }
 
@@ -193,9 +223,26 @@ fn view(plate: &Plate, cx: &mut Cx<Plate>) -> El {
         .center()
         .px(4.0)
         .hover_motion_within(Anim::INSTANT, Anim::INSTANT);
-    if plate.stable.trim().is_empty() && plate.tentative.trim().is_empty() {
+    if !plate.visible() {
         return root;
     }
+    let root = if let Some(mode) = &plate.mode {
+        root.role("status")
+            .label(tr(mode).to_owned())
+            .description(tr("Second dictation shortcut"))
+            .live_region(LiveRegion::Polite)
+    } else {
+        root
+    };
+    let mode = plate.mode.as_ref().map(|name| {
+        text(tr(name).to_owned())
+            .key("mode-badge")
+            .font(p.k.ty.ui)
+            .color(p.accent())
+            .max_w(180.0)
+            .max_lines(1)
+            .truncate()
+    });
     // The newest words stay in view: the start gives way with "…".
     let stable = text(plate.stable.trim().to_owned())
         .key("stable")
@@ -238,7 +285,9 @@ fn view(plate: &Plate, cx: &mut Cx<Plate>) -> El {
             .radius(PLATE_H / 2.0)
             .fill(c.bg_base)
             .border(p.hair, c.border_base)
-            .child(line),
+            .gap(8.0)
+            .children(mode)
+            .children(plate.has_words().then_some(line)),
     )
 }
 
@@ -255,9 +304,20 @@ mod tests {
     const HEBREW: &str = "אז התוכנית להיום";
 
     fn runtime(stable: &str, tentative: &str, dark: bool) -> Runtime<Plate> {
+        runtime_mode(stable, tentative, dark, None)
+    }
+
+    fn runtime_mode(
+        stable: &str,
+        tentative: &str,
+        dark: bool,
+        mode: Option<&str>,
+    ) -> Runtime<Plate> {
         let plate = Plate {
+            mode: mode.map(str::to_owned),
             stable: stable.into(),
             tentative: tentative.into(),
+            ..Default::default()
         };
         let mut rt = crate::rune_ui::offscreen::runtime(
             plate,
@@ -279,6 +339,46 @@ mod tests {
             .into_iter()
             .find(|e| !e.exiting && e.key.as_deref() == Some(key))
             .map(|e| e.rect)
+    }
+
+    #[test]
+    fn mode_badge_is_visible_without_live_text_and_survives_its_release() {
+        for dark in [false, true] {
+            let rt = runtime_mode("", "", dark, Some("Reword"));
+            assert!(rect(&rt, "mode-badge").is_some());
+            assert!(rect(&rt, "line").is_none());
+            let [x, _, width, height] = rect(&rt, "plate").unwrap();
+            assert!(width < SIZE.0 / 2.0);
+            assert!((x + width / 2.0 - SIZE.0 / 2.0).abs() < 1.0);
+            assert_eq!(height, PLATE_H);
+        }
+        let mut plate = Plate {
+            mode: Some("Reword".into()),
+            ..Default::default()
+        };
+        plate.set_partial(None);
+        assert!(
+            plate.visible(),
+            "releasing speech must not hide a pending rewrite's badge"
+        );
+        plate.mode = None;
+        assert!(!plate.visible());
+    }
+
+    #[test]
+    fn mode_badge_shares_the_plate_with_long_live_text_without_overflow() {
+        let rt = runtime_mode(
+            LONG,
+            " together",
+            true,
+            Some("A very long custom secondary dictation mode name"),
+        );
+        let [x, _, width, height] = rect(&rt, "plate").unwrap();
+        assert!(x >= 0.0 && x + width <= SIZE.0);
+        assert_eq!(height, PLATE_H);
+        let [bx, _, bw, _] = rect(&rt, "mode-badge").unwrap();
+        let [lx, _, lw, _] = rect(&rt, "line").unwrap();
+        assert!(bx + bw <= lx && lx + lw <= x + width);
     }
 
     #[test]
@@ -373,6 +473,54 @@ mod tests {
         assert!(!blank("so", ""));
     }
 
+    fn render_pixels(
+        gpu: &rune::render::Gpu,
+        mut rt: Runtime<Plate>,
+        dark: bool,
+    ) -> (u32, u32, Vec<u8>) {
+        let (w, h) = ((SIZE.0 * 2.0) as u32, (SIZE.1 * 2.0) as u32);
+        let mut renderer = crate::rune_ui::offscreen::renderer(&gpu.device);
+        let target = crate::rune_ui::offscreen::target(&gpu.device, w, h);
+        renderer.upload_images(&gpu.device, &gpu.queue, &mut rt.images);
+        renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut rt.text.atlas,
+            &rt.instances,
+            (w, h),
+        );
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let backdrop = if dark { 0.08 } else { 0.62 };
+        renderer.draw(
+            &mut encoder,
+            &target.view,
+            [backdrop, backdrop, backdrop, 1.0],
+        );
+        target.copy(&mut encoder);
+        gpu.queue.submit([encoder.finish()]);
+        (w, h, target.read(&gpu.device))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mode_badge_goldens() {
+        let Ok(gpu) = rune::render::Gpu::try_new(rune::render::Gpu::instance(), None) else {
+            assert!(
+                std::env::var_os("HEX_REQUIRE_GPU").is_none(),
+                "mode badge goldens need a GPU"
+            );
+            return;
+        };
+        for (name, words) in [("mode-badge", ""), ("mode-badge-with-text", SHORT)] {
+            for dark in [false, true] {
+                let (w, h, pixels) =
+                    render_pixels(&gpu, runtime_mode(words, "", dark, Some("Reword")), dark);
+                let theme = if dark { "dark" } else { "light" };
+                super::super::tests::check_golden_pixels(&format!("{name}-{theme}"), w, h, pixels);
+            }
+        }
+    }
+
     /// Renders the plate to `HEX_LIVE_TEXT_SNAPS/live-text-*.png` in both
     /// appearances, to look at.
     #[test]
@@ -380,38 +528,20 @@ mod tests {
     fn snapshots() {
         let folder = std::path::PathBuf::from(std::env::var("HEX_LIVE_TEXT_SNAPS").unwrap());
         let gpu = rune::render::Gpu::try_new(rune::render::Gpu::instance(), None).unwrap();
-        for (name, stable, tentative) in [
-            ("short", SHORT, ""),
-            ("long", LONG, ""),
-            ("tentative", SHORT, " is to finish"),
-            ("rtl", HEBREW, " והיום"),
+        for (name, stable, tentative, mode) in [
+            ("short", SHORT, "", None),
+            ("long", LONG, "", None),
+            ("tentative", SHORT, " is to finish", None),
+            ("rtl", HEBREW, " והיום", None),
+            ("mode", "", "", Some("Reword")),
+            ("mode-with-text", SHORT, "", Some("Reword")),
         ] {
             for dark in [false, true] {
-                let mut rt = runtime(stable, tentative, dark);
-                let (w, h) = ((SIZE.0 * 2.0) as u32, (SIZE.1 * 2.0) as u32);
-                let mut renderer = crate::rune_ui::offscreen::renderer(&gpu.device);
-                let target = crate::rune_ui::offscreen::target(&gpu.device, w, h);
-                renderer.upload_images(&gpu.device, &gpu.queue, &mut rt.images);
-                renderer.prepare(
-                    &gpu.device,
-                    &gpu.queue,
-                    &mut rt.text.atlas,
-                    &rt.instances,
-                    (w, h),
-                );
-                let mut encoder = gpu.device.create_command_encoder(&Default::default());
-                // A desktop grey behind the clear overlay.
-                let backdrop = if dark { 0.08 } else { 0.62 };
-                renderer.draw(
-                    &mut encoder,
-                    &target.view,
-                    [backdrop, backdrop, backdrop, 1.0],
-                );
-                target.copy(&mut encoder);
-                gpu.queue.submit([encoder.finish()]);
+                let (w, h, pixels) =
+                    render_pixels(&gpu, runtime_mode(stable, tentative, dark, mode), dark);
                 let theme = if dark { "dark" } else { "light" };
                 let path = folder.join(format!("live-text-{name}-{theme}.png"));
-                rune::render::write_png(&path, w, h, &target.read(&gpu.device)).unwrap();
+                rune::render::write_png(&path, w, h, &pixels).unwrap();
             }
         }
     }

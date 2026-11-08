@@ -162,6 +162,14 @@ impl Hotkeys {
         };
     }
 
+    fn indicator_mode(&self, shortcut: Shortcut) -> Option<&str> {
+        (shortcut == Shortcut::Second).then(|| {
+            self.mode_capture
+                .as_deref()
+                .unwrap_or("Second dictation shortcut")
+        })
+    }
+
     fn context(&self, context: &ContextSnapshot) -> ContextSnapshot {
         ContextSnapshot {
             processing_mode: self.mode_capture.clone(),
@@ -388,6 +396,7 @@ pub fn listen(
         .flatten();
     let mut next_programmatic_id = 1_u64;
     let mut programmatic = None::<ProgrammaticDictation>;
+    let mut programmatic_indicator_recording = false;
     let mut programmatic_lost = None::<LostProgrammaticDictation>;
     let mut programmatic_results =
         BTreeMap::<crate::parakeet::DictationJobId, FinishingProgrammaticDictation>::new();
@@ -830,6 +839,7 @@ pub fn listen(
             handle_hotkey_action(
                 HotkeyAction::Cancel,
                 false,
+                None,
                 input.captured_through(),
                 &input,
                 &dictation_worker,
@@ -855,6 +865,7 @@ pub fn listen(
             handle_hotkey_action(
                 HotkeyAction::Cancel,
                 false,
+                None,
                 input.captured_through(),
                 &input,
                 &dictation_worker,
@@ -940,6 +951,7 @@ pub fn listen(
                 let accepted = handle_hotkey_action(
                     action,
                     hotkeys.raw_capture,
+                    hotkeys.indicator_mode(shortcut),
                     capture_at,
                     &input,
                     &dictation_worker,
@@ -1139,6 +1151,14 @@ pub fn listen(
             }
         }
 
+        // Observe the shared state after controls, lease expiry and audio
+        // failures, so every silent API capture end restores pending badges.
+        sync_programmatic_indicator(
+            programmatic.is_some(),
+            &mut programmatic_indicator_recording,
+            indicator.as_ref(),
+        );
+
         // Every chunk already queued, not one per pass: a pass can take
         // longer than a chunk lasts, and a backlog that overflows leaves the
         // meter only stale audio.
@@ -1177,10 +1197,29 @@ pub fn listen(
         device: input.device_name(),
     })?;
     events.flush()?;
+    sync_programmatic_indicator(
+        false,
+        &mut programmatic_indicator_recording,
+        indicator.as_ref(),
+    );
     if let Some(indicator) = &indicator {
         indicator.send(DictationIndicatorEvent::Discarded);
     }
     Ok(())
+}
+
+fn sync_programmatic_indicator(
+    recording: bool,
+    previous: &mut bool,
+    indicator: Option<&DictationIndicatorSender>,
+) {
+    if recording == *previous {
+        return;
+    }
+    *previous = recording;
+    if let Some(indicator) = indicator {
+        indicator.send(DictationIndicatorEvent::ProgrammaticRecording { recording });
+    }
 }
 
 fn log_programmatic_ended(active: Option<ProgrammaticDictation>, outcome: &str) {
@@ -1274,6 +1313,7 @@ fn cancel_programmatic_capture(
 fn handle_hotkey_action(
     action: HotkeyAction,
     raw: bool,
+    mode: Option<&str>,
     action_at: CaptureInstant,
     dictation: &DictationAudio,
     worker: &DictationWorker,
@@ -1299,7 +1339,9 @@ fn handle_hotkey_action(
             worker.prepare_paste();
             events.dictation(DictationPhase::Started, "")?;
             if let Some(indicator) = indicator {
-                indicator.send(DictationIndicatorEvent::Started);
+                indicator.send(mode.map_or(DictationIndicatorEvent::Started, |name| {
+                    DictationIndicatorEvent::StartedWithMode(name.to_owned())
+                }));
             }
             emit_state(events, true, device)
         }
@@ -1486,6 +1528,7 @@ fn control_dictation(
             handle_hotkey_action(
                 HotkeyAction::CancelShortcut,
                 false,
+                None,
                 input.captured_through(),
                 input,
                 worker,
@@ -1522,6 +1565,7 @@ fn control_dictation(
             let accepted = handle_hotkey_action(
                 HotkeyAction::Start,
                 raw,
+                None,
                 capture_boundary(input, release_while_idle),
                 input,
                 worker,
@@ -1939,6 +1983,30 @@ mod tests {
     }
 
     #[test]
+    fn mode_badge_programmatic_observer_routes_only_capture_presence_transitions() {
+        let (indicator, events) = crate::dictation::indicator::channel();
+        let mut recording = false;
+        sync_programmatic_indicator(false, &mut recording, Some(&indicator));
+        assert!(events.try_recv().is_err());
+        sync_programmatic_indicator(true, &mut recording, Some(&indicator));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            DictationIndicatorEvent::ProgrammaticRecording { recording: true }
+        ));
+        sync_programmatic_indicator(true, &mut recording, Some(&indicator));
+        assert!(events.try_recv().is_err());
+        // Finish, cancel, lease expiry and microphone loss all take the same
+        // active Option before the loop's one observer; none need HUD starts.
+        sync_programmatic_indicator(false, &mut recording, Some(&indicator));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            DictationIndicatorEvent::ProgrammaticRecording { recording: false }
+        ));
+        sync_programmatic_indicator(false, &mut recording, Some(&indicator));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
     fn second_shortcut_latches_its_mode_and_other_starts_clear_it() {
         let mut hotkeys = Hotkeys {
             dictation: DictationHotkey::new(
@@ -1956,6 +2024,9 @@ mod tests {
             ..ContextSnapshot::default()
         };
         hotkeys.start_processing(Shortcut::Second, Some("Reword".into()));
+        assert_eq!(hotkeys.indicator_mode(Shortcut::Second), Some("Reword"));
+        assert_eq!(hotkeys.indicator_mode(Shortcut::Dictation), None);
+        assert_eq!(hotkeys.indicator_mode(Shortcut::Raw), None);
         let queued = hotkeys.context(&foreground);
         assert_eq!(queued.processing_mode.as_deref(), Some("Reword"));
         assert!(!hotkeys.raw_capture);
@@ -1966,6 +2037,10 @@ mod tests {
         assert!(hotkeys.context(&foreground).processing_mode.is_none());
         assert_eq!(queued.processing_mode.as_deref(), Some("Reword"));
         hotkeys.start_processing(Shortcut::Second, None);
+        assert_eq!(
+            hotkeys.indicator_mode(Shortcut::Second),
+            Some("Second dictation shortcut")
+        );
         assert!(!hotkeys.raw_capture);
         assert!(hotkeys.context(&foreground).processing_mode.is_none());
     }

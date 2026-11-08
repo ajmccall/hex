@@ -25,6 +25,27 @@ The initiating shortcut latches the name; releases, double-tap locking, CLI stop
 
 The second shortcut is macOS-only, like the existing lab it extends. Linux and Windows retain their existing app/site processing and raw bypass. The feature is off until the existing lab is enabled and a second shortcut is bound. No new microphone capture, subprocess, provider, or paste path is introduced.
 
+## Visual confirmation
+
+While the second shortcut records, a click-through badge just past the HUD
+shows its latched mode name, such as **Reword**. It stays while that dictation
+transcribes and rewrites, and clears on completion, cancellation, discard,
+failure, or a reset. The second key with automatic selection says **Second
+dictation shortcut**. Fn/raw/programmatic dictation has no secondary badge.
+
+The badge shares the existing live-text plate, but does **not** require
+Labs → Live text. With Live text enabled, the mode and words share one
+plate. Names are clipped to one line; the plate takes no clicks or focus.
+It follows the HUD's placement and respects Hidden. A new recording owns
+its label; otherwise the oldest pending job does, so an older rewrite cannot
+label a newer Fn capture as Reword. Changing settings mid-capture does not
+change the latched label. A silent API recording temporarily masks pending-job
+badges without adding a recording HUD of its own; finish, cancel, lease expiry,
+and microphone loss all restore ownership to any still-pending job.
+
+This confirms the requested secondary mode, **not** that an AI rewrite
+succeeded: deadline/provider failures still use the existing cleaned fallback.
+
 ## Build and opt in
 
 Build as a local copy so upstream automatic updates cannot replace the fork:
