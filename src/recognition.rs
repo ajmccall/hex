@@ -28,52 +28,15 @@ use crate::suppression::{DictationHotkey, DiscardCause, HotkeyAction, InputMonit
 mod context_watch;
 mod guards;
 mod hotkeys;
+mod indicator;
 
 use context_watch::ContextWatch;
 use guards::{
-    caps_lock_can_press, capture_boundary, capture_refusal, claims_escape, paste_last_refusal,
+    CaptureEnd, FinishResult, caps_lock_can_press, capture_boundary, capture_refusal,
+    claims_escape, paste_last_refusal,
 };
 use hotkeys::{Hotkeys, Shortcut};
-
-enum FinishResult {
-    Discarded,
-    Silent,
-    Submitted,
-    Rejected(String),
-}
-
-/// The HUD and the Caps Lock light see the same dictation events. The HUD
-/// channel has one consumer; the light's model is fed beside each send
-/// instead of taking that channel over.
-#[derive(Clone, Copy)]
-struct DictationSink<'a> {
-    hud: Option<&'a DictationIndicatorSender>,
-    caps_lock: &'a crate::caps_lock_dictation::CapsLockDictation,
-}
-
-impl DictationSink<'_> {
-    fn send(&self, event: DictationIndicatorEvent) {
-        if let Some(hud) = self.hud {
-            hud.send(event.clone());
-        }
-        self.caps_lock.observe(event);
-    }
-
-    /// One chunk's loudness reaches both consumers: the light even when no
-    /// HUD listens, and the HUD exactly as it would have received it.
-    fn meter(&self, samples: &[f32]) {
-        if let Some(event) = DictationIndicatorEvent::meter(samples) {
-            self.send(event);
-        }
-    }
-
-    /// A non-dictation capture (Annotate) moves only the Caps Lock light, not
-    /// the dictation HUD.
-    #[cfg(hex_capture)]
-    fn caps_only(&self, event: DictationIndicatorEvent) {
-        self.caps_lock.observe(event);
-    }
-}
+use indicator::{DictationSink, sync_programmatic_indicator};
 
 #[derive(Debug)]
 pub enum RecognitionControl {
@@ -232,6 +195,7 @@ pub fn listen(
         .flatten();
     let mut next_programmatic_id = 1_u64;
     let mut programmatic = None::<ProgrammaticDictation>;
+    let mut programmatic_indicator_recording = false;
     let mut programmatic_lost = None::<LostProgrammaticDictation>;
     let mut programmatic_results =
         BTreeMap::<crate::parakeet::DictationJobId, FinishingProgrammaticDictation>::new();
@@ -291,6 +255,7 @@ pub fn listen(
             handle_hotkey_action(
                 HotkeyAction::Cancel,
                 false,
+                None,
                 input.captured_through(),
                 &input,
                 &dictation_worker,
@@ -692,6 +657,7 @@ pub fn listen(
             handle_hotkey_action(
                 HotkeyAction::Cancel,
                 false,
+                None,
                 input.captured_through(),
                 &input,
                 &dictation_worker,
@@ -717,6 +683,7 @@ pub fn listen(
             handle_hotkey_action(
                 HotkeyAction::Cancel,
                 false,
+                None,
                 input.captured_through(),
                 &input,
                 &dictation_worker,
@@ -748,9 +715,13 @@ pub fn listen(
             let Some(action) = hotkeys.caps_lock_press() else {
                 continue;
             };
+            if action == HotkeyAction::Start {
+                context.set_processing_mode(hotkeys.processing_mode());
+            }
             let accepted = handle_hotkey_action(
                 action,
                 hotkeys.raw_capture,
+                None,
                 at,
                 &input,
                 &dictation_worker,
@@ -762,6 +733,7 @@ pub fn listen(
             )?;
             if !accepted {
                 hotkeys.suspend(Shortcut::CapsLock);
+                context.clear_processing_mode();
             }
         }
         // The capture shortcut ignores keys while shortcuts are suspended or
@@ -830,11 +802,16 @@ pub fn listen(
             }
             for (shortcut, action) in hotkeys.process(input_event, capture_at) {
                 if action == HotkeyAction::Start {
-                    hotkeys.raw_capture = shortcut == Shortcut::Raw;
+                    hotkeys.start_processing(
+                        shortcut,
+                        crate::dictation::config::second_shortcut_mode(),
+                    );
+                    context.set_processing_mode(hotkeys.processing_mode());
                 }
                 let accepted = handle_hotkey_action(
                     action,
                     hotkeys.raw_capture,
+                    hotkeys.indicator_mode(shortcut),
                     capture_at,
                     &input,
                     &dictation_worker,
@@ -846,6 +823,7 @@ pub fn listen(
                 )?;
                 if !accepted {
                     hotkeys.suspend(shortcut);
+                    context.clear_processing_mode();
                 }
             }
         }
@@ -1048,6 +1026,14 @@ pub fn listen(
             }
         }
 
+        // Observe silent API captures after controls, lease expiry, and audio
+        // failures so a pending badge returns as soon as one ends.
+        sync_programmatic_indicator(
+            programmatic.is_some(),
+            &mut programmatic_indicator_recording,
+            indicator,
+        );
+
         // Every chunk already queued, not one per pass: a pass can take
         // longer than a chunk lasts, and a backlog that overflows leaves the
         // meter only stale audio.
@@ -1095,6 +1081,7 @@ pub fn listen(
         device: input.device_name(),
     })?;
     events.flush()?;
+    sync_programmatic_indicator(false, &mut programmatic_indicator_recording, indicator);
     indicator.send(DictationIndicatorEvent::Discarded);
     Ok(())
 }
@@ -1190,6 +1177,7 @@ fn cancel_programmatic_capture(
 fn handle_hotkey_action(
     action: HotkeyAction,
     raw: bool,
+    mode: Option<&str>,
     action_at: CaptureInstant,
     dictation: &DictationAudio,
     worker: &DictationWorker,
@@ -1221,26 +1209,29 @@ fn handle_hotkey_action(
             #[cfg(hex_capture)]
             crate::screenshots::narration::started();
             events.dictation(DictationPhase::Started, "")?;
-            indicator.send(DictationIndicatorEvent::Started);
+            indicator.send(mode.map_or(DictationIndicatorEvent::Started, |name| {
+                DictationIndicatorEvent::StartedWithMode(name.to_owned())
+            }));
             emit_state(events, true, device)
         }
         HotkeyAction::Finish => {
             // The capture's own page, or none rather than the last
             // dictation's.
-            let context = context.finish(events)?;
-            finish_hotkey_dictation(
+            let capture_context = context.finish(events)?;
+            let finished = finish_hotkey_dictation(
                 action_at,
                 dictation,
                 worker,
-                &context,
+                &capture_context,
                 device,
                 events,
                 indicator,
                 release_while_idle,
                 None,
                 raw,
-            )
-            .map(drop)
+            );
+            context.clear_processing_mode();
+            finished.map(drop)
         }
         HotkeyAction::Discard(_) | HotkeyAction::Cancel | HotkeyAction::CancelShortcut => {
             context.cancel();
@@ -1394,6 +1385,7 @@ fn control_dictation(
             handle_hotkey_action(
                 HotkeyAction::CancelShortcut,
                 false,
+                None,
                 input.captured_through(),
                 input,
                 worker,
@@ -1419,10 +1411,19 @@ fn control_dictation(
                     "the dictation shortcut is held; release it and try again",
                 ));
             }
-            hotkeys.raw_capture = raw;
+            hotkeys.start_processing(
+                if raw {
+                    Shortcut::Raw
+                } else {
+                    Shortcut::Dictation
+                },
+                None,
+            );
+            context.set_processing_mode(None);
             let accepted = handle_hotkey_action(
                 HotkeyAction::Start,
                 raw,
+                None,
                 capture_boundary(input, release_while_idle),
                 input,
                 worker,
@@ -1454,12 +1455,12 @@ fn control_dictation(
             let printing = print.is_some();
             // A control capture asked for its page when it started; this
             // waits for that read if it is still in flight.
-            let context = context.finish(events)?;
+            let capture_context = context.finish(events)?;
             let finished = finish_hotkey_dictation(
                 capture_boundary(input, release_while_idle),
                 input,
                 worker,
-                &context,
+                &capture_context,
                 &device,
                 events,
                 indicator,
@@ -1467,6 +1468,7 @@ fn control_dictation(
                 print,
                 hotkeys.raw_capture,
             )?;
+            context.clear_processing_mode();
             match finished {
                 FinishResult::Discarded | FinishResult::Silent if printing => {
                     ControlReply::error("no-speech", "no speech was recorded; nothing to print")
@@ -1515,15 +1517,6 @@ fn fail_capture(
         message: Some(message),
     });
     emit_engine_state(events, false, worker, device)
-}
-
-#[derive(Clone, Copy)]
-enum CaptureEnd {
-    /// The capture never became a dictation; no feedback tone.
-    Discarded(Option<DiscardCause>),
-    /// The capture ended unfinished: the cancel shortcut, or Hex itself
-    /// when its shortcuts were suspended or the event tap was lost.
-    Cancelled,
 }
 
 /// Cancels the active capture before reporting the ending.
@@ -1788,6 +1781,7 @@ mod tests {
             extra: std::array::from_fn(|_| None),
             caps_lock: DictationHotkey::new(base, false, RuntimeHotkey::default()),
             raw_capture: false,
+            mode_capture: None,
         };
         let mut press = |flags: u64, ms: u64| hotkeys.process(InputEvent::Flags(flags), at(ms));
         const START: HotkeyAction = HotkeyAction::Start;
@@ -1819,6 +1813,36 @@ mod tests {
         assert!(!hotkeys.any_recording());
     }
 
+    #[test]
+    fn second_shortcut_latches_its_mode_and_other_starts_clear_it() {
+        let mut hotkeys = Hotkeys::new(
+            DictationHotkey::new(
+                CaptureInstant::now(),
+                false,
+                crate::app_settings::RuntimeHotkey::default(),
+            ),
+            DictationHotkey::new(
+                CaptureInstant::now(),
+                false,
+                crate::app_settings::RuntimeHotkey::default(),
+            ),
+        );
+        hotkeys.start_processing(Shortcut::Second, Some("Reword".into()));
+        assert_eq!(hotkeys.processing_mode().as_deref(), Some("Reword"));
+        assert_eq!(hotkeys.indicator_mode(Shortcut::Second), Some("Reword"));
+        hotkeys.start_processing(Shortcut::Dictation, Some("Ignored".into()));
+        assert!(hotkeys.processing_mode().is_none());
+        assert!(hotkeys.indicator_mode(Shortcut::Dictation).is_none());
+        hotkeys.start_processing(Shortcut::Raw, Some("Reword".into()));
+        assert!(hotkeys.raw_capture);
+        assert!(hotkeys.processing_mode().is_none());
+        hotkeys.start_processing(Shortcut::Second, None);
+        assert_eq!(
+            hotkeys.indicator_mode(Shortcut::Second),
+            Some("Second dictation shortcut")
+        );
+    }
+
     /// A bound extra row's machine, as the listener configures it.
     fn extra_hotkeys(
         base: CaptureInstant,
@@ -1836,6 +1860,7 @@ mod tests {
             extra: std::array::from_fn(|_| None),
             caps_lock: DictationHotkey::new(base, false, RuntimeHotkey::default()),
             raw_capture: false,
+            mode_capture: None,
         };
         hotkeys.rebind_extra(bindings, base);
         let cancel = crate::app_settings::HotkeyBinding::cancel_default().runtime();
@@ -2084,6 +2109,7 @@ mod tests {
             extra: std::array::from_fn(|_| None),
             caps_lock,
             raw_capture: false,
+            mode_capture: None,
         }
     }
 

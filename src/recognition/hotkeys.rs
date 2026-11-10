@@ -56,6 +56,9 @@ pub(super) struct Hotkeys {
     /// The recording (or the last) skips processing: the raw shortcut or
     /// `hex dictation start --raw` started it.
     pub(super) raw_capture: bool,
+    /// An explicit mode latched by the second shortcut until this capture
+    /// finishes. All other starts clear it.
+    pub(super) mode_capture: Option<String>,
 }
 
 impl Hotkeys {
@@ -69,7 +72,32 @@ impl Hotkeys {
             extra: std::array::from_fn(|_| None),
             caps_lock,
             raw_capture: false,
+            mode_capture: None,
         }
+    }
+
+    /// Latches the mode that belongs to a capture at its start. Only the
+    /// second shortcut selects a named processing mode.
+    pub(super) fn start_processing(&mut self, shortcut: Shortcut, second_mode: Option<String>) {
+        self.raw_capture = shortcut == Shortcut::Raw;
+        self.mode_capture = (shortcut == Shortcut::Second)
+            .then_some(second_mode)
+            .flatten();
+    }
+
+    /// The mode latched by the shortcut that owns the active capture.
+    pub(super) fn processing_mode(&self) -> Option<String> {
+        self.mode_capture.clone()
+    }
+
+    /// The secondary shortcut identifies itself in the HUD even when its
+    /// processing setting is Automatic.
+    pub(super) fn indicator_mode(&self, shortcut: Shortcut) -> Option<&str> {
+        (shortcut == Shortcut::Second).then(|| {
+            self.mode_capture
+                .as_deref()
+                .unwrap_or("Second dictation shortcut")
+        })
     }
 
     /// The fixed shortcuts' machines, in matching order. The extra rows have
@@ -266,7 +294,7 @@ impl Hotkeys {
         }
         let action = self.caps_lock.caps_lock_toggle()?;
         if action == HotkeyAction::Start {
-            self.raw_capture = false;
+            self.start_processing(Shortcut::CapsLock, None);
         }
         Some(action)
     }

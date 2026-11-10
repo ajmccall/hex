@@ -59,6 +59,7 @@ mod scenes;
 mod scrawl;
 #[cfg(hex_capture)]
 pub(crate) mod screenshot_thumbnail;
+mod second_shortcut;
 mod settings;
 mod shortcut_mode;
 mod shortcut_rule;

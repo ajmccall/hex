@@ -884,14 +884,20 @@ const DIFFERENCES: &[(&str, Difference)] = &[
              would need their own adapters",
         ),
     ),
+    (
+        "second_dictation_shortcut",
+        Difference::Pending(
+            "the second dictation shortcut machine is implemented only in the macOS listener",
+        ),
+    ),
 ];
 
 impl Capabilities {
     /// Every capability by name. Destructuring makes a new capability a
     /// compile error here until it is named.
-    pub(super) fn fields(self) -> [(&'static str, bool); 14] {
+    pub(super) fn fields(self) -> [(&'static str, bool); 15] {
         let Self {
-            os: _,
+            os,
             meetings,
             calendar,
             permissions,
@@ -922,6 +928,7 @@ impl Capabilities {
             ("modifier_sides", modifier_sides),
             ("keyboard_model_switching", keyboard_model_switching),
             ("typed_text", typed_text),
+            ("second_dictation_shortcut", os == Os::Macos),
         ]
     }
 }

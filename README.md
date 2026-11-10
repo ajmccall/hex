@@ -1,5 +1,8 @@
 # Hex
 
+Personal fork: [optional Reword shortcut for macOS](docs/personal-reword.md),
+with ordinary filler cleanup preserved. Upstream: [anomalyco/hex](https://github.com/anomalyco/hex).
+
 Hex is local voice dictation for Mac, Windows and Linux. Hold a key, speak, and
 it pastes.
 

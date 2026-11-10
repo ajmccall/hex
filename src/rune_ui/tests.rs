@@ -1302,6 +1302,52 @@ fn history_selects_deletes_and_clears_in_two_steps() {
 }
 
 #[test]
+fn second_shortcut_processing_selects_a_named_mode_or_automatic_without_changing_the_main_key() {
+    let mut rt = runtime("mac-settings-reword", true, PANE_SIZE);
+    let main = rt.state.settings.dictation_hotkey.clone();
+    assert_eq!(
+        rt.state
+            .settings
+            .dictation_processing
+            .second_shortcut_mode
+            .as_deref(),
+        Some("Reword")
+    );
+    for (label, selected) in [
+        ("Default", None),
+        ("Global", Some("Global")),
+        ("Reword", Some("Reword")),
+    ] {
+        tap(&mut rt, "second-shortcut-mode-field-trigger");
+        let item = menu_item(&rt, "second-shortcut-mode", label);
+        tap(&mut rt, &item);
+        assert_eq!(
+            rt.state
+                .settings
+                .dictation_processing
+                .second_shortcut_mode
+                .as_deref(),
+            selected
+        );
+        assert_eq!(rt.state.settings.dictation_hotkey, main);
+    }
+    let off = runtime("mac-settings", true, PANE_SIZE);
+    assert!(off.find("second-shortcut-mode-field-trigger").is_none());
+    let mut linux = runtime("portal", true, PANE_SIZE);
+    linux.state.settings.labs.second_dictation_shortcut = true;
+    linux.invalidate();
+    settle(&mut linux);
+    assert!(linux.find("second-shortcut-mode-field-trigger").is_none());
+}
+
+#[test]
+fn second_shortcut_processing_goldens() {
+    for dark in [true, false] {
+        check_golden("mac-settings-reword", dark, PANE_SIZE);
+    }
+}
+
+#[test]
 fn history_stats_button_opens_and_closes_the_dialog() {
     let mut rt = runtime("history", true, PANE_SIZE);
     assert!(!rt.state.settings.labs.history_stats);
@@ -2811,13 +2857,18 @@ fn check_golden(scene: &str, dark: bool, size: (f32, f32)) {
         eprintln!("skipping golden {name}: no GPU adapter");
         return;
     };
+    check_golden_pixels(&name, width, height, pixels);
+}
+
+/// Shared with the click-through mode/live-text plate's fixture renders.
+pub(super) fn check_golden_pixels(name: &str, width: u32, height: u32, pixels: Vec<u8>) {
     if let Some(folder) = std::env::var_os("HEX_GOLDEN_RENDERS") {
         let folder = std::path::PathBuf::from(folder);
         std::fs::create_dir_all(&folder).unwrap();
         rune::render::write_png(&folder.join(format!("{name}.png")), width, height, &pixels)
             .unwrap();
     }
-    let path = golden_path(&name);
+    let path = golden_path(name);
     if std::env::var_os("HEX_UPDATE_GOLDENS").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         rune::render::write_png(&path, width, height, &pixels).unwrap();

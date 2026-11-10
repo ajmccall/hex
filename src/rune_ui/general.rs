@@ -64,8 +64,12 @@ pub(super) fn basics(ui: &Ui, p: Paint, layer: &mut Vec<El>, query: &str) -> Opt
         }
         // Labs › Second dictation shortcut (macOS): another key that
         // dictates like the one above, such as on an external keyboard.
-        #[cfg(target_os = "macos")]
-        if crate::labs::Feature::SecondDictationShortcut.on(&ui.settings) {
+        if ui.platform.caps.os == super::platform::Os::Macos
+            && crate::labs::Feature::SecondDictationShortcut.on(&ui.settings)
+        {
+            // The fixture simulates macOS on Linux to cover the selector, but
+            // its native shortcut recorder exists only in the macOS app.
+            #[cfg(target_os = "macos")]
             rows.extend_described(
                 tr("Second dictation shortcut"),
                 Some(tr("Dictates like the shortcut above")),
@@ -78,6 +82,10 @@ pub(super) fn basics(ui: &Ui, p: Paint, layer: &mut Vec<El>, query: &str) -> Opt
                     ShortcutTarget::SecondDictation,
                     Some(tr("Dictates like the shortcut above")),
                 ),
+            );
+            rows.push(
+                tr("Processing"),
+                super::second_shortcut::processing_row(ui, p, layer),
             );
         }
         // Labs › More dictation shortcuts (macOS): up to four more keys that

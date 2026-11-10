@@ -4,6 +4,7 @@
 use crate::audio::CaptureInstant;
 use crate::control::ControlReply;
 use crate::dictation::audio::DictationAudio;
+use crate::suppression::DiscardCause;
 
 /// Whether Hex takes Escape from the app in front: only for a capture
 /// (drawing, its press, the capsule's picker), never for dictation, and never
@@ -15,6 +16,23 @@ pub(super) fn claims_escape(programmatic: bool, capture_escape: bool) -> bool {
 
 /// Whether a Caps Lock press may act. An Annotate capture records the
 /// narration itself, so a Caps Lock press must not start a dictation over it;
+/// How a capture finish was handled.
+pub(super) enum FinishResult {
+    Discarded,
+    Silent,
+    Submitted,
+    Rejected(String),
+}
+
+/// How a capture ends before its transcription job completes.
+#[derive(Clone, Copy)]
+pub(super) enum CaptureEnd {
+    /// The capture never became a dictation; no feedback tone.
+    Discarded(Option<DiscardCause>),
+    /// The cancel shortcut or listener recovery ended the capture.
+    Cancelled,
+}
+
 /// a press that finishes an already-running Caps Lock capture still works.
 pub(super) fn caps_lock_can_press(caps_recording: bool, annotate_recording: bool) -> bool {
     caps_recording || !annotate_recording

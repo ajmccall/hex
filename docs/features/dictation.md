@@ -2031,6 +2031,11 @@ Dot scope                                    // dot_scope
 │   │   at least 16 dB above the room and the −60 dB noise floor   // AutoLevel
 │   ├── Auto level off -> Fixed RMS window, −40 to −10 dB
 │   └── Warm pearl; history travels out from the centre; phosphor tail 0.6 s
+├── Second dictation shortcut (personal macOS fork) -> Latched mode badge, e.g. Reword
+│   ├── Click-through plate just past the HUD; independent of Labs › Live text
+│   ├── Remains through transcription/rewrite; clears on every terminal outcome
+│   ├── New recording owns the badge; otherwise oldest pending job owns it
+│   └── Hidden HUD hides the badge too; the label confirms selection, not AI success
 ├── Locked / hands-free -> Same as recording; the HUD draws no lock
 ├── Transcribing / Processing -> Processing look, at least 200 ms so a fast
 │   transcription still shows it (PROCESSING_MIN_DURATION):
@@ -2111,6 +2116,14 @@ puts its placement and look into the one tuning it shares with HUD Lab
 
 Hex meters no spectrum, so the prototype's band emphasis is the same for
 every component.
+
+The personal fork's badge reuses the live-text plate
+([rune_ui/live_text.rs](../../src/rune_ui/live_text.rs)). `scripts/check mode_badge`
+covers capture/queue/terminal label ownership, independent visibility without
+live words, combined-word bounds, and Linux light/dark reference renders.
+`recognition::tests::second_shortcut_latches_its_mode_and_other_starts_clear_it`
+also checks which shortcut gets a label. These do not prove a real physical
+key or native overlay visibility; those still need a post-install smoke test.
 
 Check: `scripts/check rune_hud::dot_scope` (defaults, knobs, frame-rate independence,
 Reduce Motion, the stages, auto level, each processing
