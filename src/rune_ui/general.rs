@@ -83,7 +83,10 @@ pub(super) fn basics(ui: &Ui, p: Paint, layer: &mut Vec<El>, query: &str) -> Opt
                     Some(tr("Dictates like the shortcut above")),
                 ),
             );
-            rows.push(super::second_shortcut::processing_row(ui, p, layer));
+            rows.push(
+                tr("Processing"),
+                super::second_shortcut::processing_row(ui, p, layer),
+            );
         }
         // Labs › More dictation shortcuts (macOS): up to four more keys that
         // each dictate like the one above, each with its own shortcut mode.

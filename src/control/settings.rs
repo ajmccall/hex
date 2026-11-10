@@ -1,15 +1,13 @@
 //! The `hex settings` registry: one key per persisted setting, named by its
 //! dotted path in `settings.json`, with the same rules and side effects the
 //! window applies when you change it there.
-
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-
 use super::ControlError;
 use crate::app_settings::{
     AppSettings, CALENDAR_LEAD_MINUTES, HotkeyBinding, HotkeyKey, HotkeySlot,
     MAX_EXTRA_DICTATION_SHORTCUTS,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 mod hotkeys;
 

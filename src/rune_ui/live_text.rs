@@ -529,10 +529,10 @@ fn view(plate_state: &Plate, cx: &mut Cx<Plate>) -> El {
     };
     root.child(plate(
         &p,
-        row()
-            .gap(8.0)
-            .children(mode)
-            .children((!plate_state.stable.trim().is_empty() || !plate_state.tentative.trim().is_empty()).then_some(line)),
+        row().gap(8.0).children(mode).children(
+            (!plate_state.stable.trim().is_empty() || !plate_state.tentative.trim().is_empty())
+                .then_some(line),
+        ),
     ))
 }
 
@@ -623,6 +623,48 @@ mod tests {
             .into_iter()
             .find(|e| !e.exiting && e.key.as_deref() == Some(key))
             .map(|e| e.rect)
+    }
+
+    #[test]
+    fn mode_badge_is_visible_without_live_text_and_survives_its_release() {
+        for dark in [false, true] {
+            let rt = runtime_plate(
+                Plate {
+                    mode: Some("Reword".into()),
+                    ..Default::default()
+                },
+                dark,
+            );
+            assert!(rect(&rt, "mode-badge").is_some());
+            assert!(rect(&rt, "line").is_none());
+        }
+        let mut plate = Plate {
+            mode: Some("Reword".into()),
+            ..Default::default()
+        };
+        plate.words_ended();
+        assert!(!plate.should_hide());
+        plate.mode = None;
+        assert!(plate.should_hide());
+    }
+
+    #[test]
+    fn mode_badge_shares_the_plate_with_long_live_text_without_overflow() {
+        let rt = runtime_plate(
+            Plate {
+                mode: Some("A very long custom secondary dictation mode name".into()),
+                stable: LONG.into(),
+                tentative: " together".into(),
+                ..Default::default()
+            },
+            true,
+        );
+        let [x, _, width, height] = rect(&rt, "plate").unwrap();
+        assert!(x >= 0.0 && x + width <= SIZE.0);
+        assert_eq!(height, PLATE_H);
+        let [bx, _, bw, _] = rect(&rt, "mode-badge").unwrap();
+        let [lx, _, lw, _] = rect(&rt, "line").unwrap();
+        assert!(bx + bw <= lx && lx + lw <= x + width);
     }
 
     #[test]
@@ -754,6 +796,62 @@ mod tests {
         assert!(blank("  ", " "));
         assert!(!blank("", " so"));
         assert!(!blank("so", ""));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn render_pixels(
+        gpu: &rune::render::Gpu,
+        mut rt: Runtime<Plate>,
+        dark: bool,
+    ) -> (u32, u32, Vec<u8>) {
+        let (w, h) = ((SIZE.0 * 2.0) as u32, (SIZE.1 * 2.0) as u32);
+        let mut renderer = crate::rune_ui::offscreen::renderer(&gpu.device);
+        let target = crate::rune_ui::offscreen::target(&gpu.device, w, h);
+        renderer.upload_images(&gpu.device, &gpu.queue, &mut rt.images);
+        renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut rt.text.atlas,
+            &rt.instances,
+            (w, h),
+        );
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let backdrop = if dark { 0.08 } else { 0.62 };
+        renderer.draw(
+            &mut encoder,
+            &target.view,
+            [backdrop, backdrop, backdrop, 1.0],
+        );
+        target.copy(&mut encoder);
+        gpu.queue.submit([encoder.finish()]);
+        (w, h, target.read(&gpu.device))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mode_badge_goldens() {
+        let Ok(gpu) = rune::render::Gpu::try_new(rune::render::Gpu::instance(), None) else {
+            assert!(std::env::var_os("HEX_REQUIRE_GPU").is_none());
+            return;
+        };
+        for (name, words) in [("mode-badge", ""), ("mode-badge-with-text", SHORT)] {
+            for dark in [false, true] {
+                let (w, h, pixels) = render_pixels(
+                    &gpu,
+                    runtime_plate(
+                        Plate {
+                            mode: Some("Reword".into()),
+                            stable: words.into(),
+                            ..Default::default()
+                        },
+                        dark,
+                    ),
+                    dark,
+                );
+                let theme = if dark { "dark" } else { "light" };
+                super::super::tests::check_golden_pixels(&format!("{name}-{theme}"), w, h, pixels);
+            }
+        }
     }
 
     /// Renders the plate to `HEX_LIVE_TEXT_SNAPS/live-text-*.png` in both

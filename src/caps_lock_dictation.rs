@@ -147,7 +147,11 @@ impl LedModel {
                 self.capture = CaptureState::Idle;
                 self.jobs.clear();
             }
-            DictationIndicatorEvent::Started => self.capture = CaptureState::Waiting,
+            DictationIndicatorEvent::Started | DictationIndicatorEvent::StartedWithMode(_) => {
+                self.capture = CaptureState::Waiting
+            }
+            // Programmatic dictation has no Caps Lock interaction.
+            DictationIndicatorEvent::ProgrammaticRecording { .. } => {}
             // The first audio proves the microphone is delivering; a Meter
             // with no capture started must turn nothing on.
             DictationIndicatorEvent::Meter { .. } => {

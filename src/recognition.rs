@@ -28,52 +28,15 @@ use crate::suppression::{DictationHotkey, DiscardCause, HotkeyAction, InputMonit
 mod context_watch;
 mod guards;
 mod hotkeys;
+mod indicator;
 
 use context_watch::ContextWatch;
 use guards::{
-    caps_lock_can_press, capture_boundary, capture_refusal, claims_escape, paste_last_refusal,
+    CaptureEnd, FinishResult, caps_lock_can_press, capture_boundary, capture_refusal,
+    claims_escape, paste_last_refusal,
 };
 use hotkeys::{Hotkeys, Shortcut};
-
-enum FinishResult {
-    Discarded,
-    Silent,
-    Submitted,
-    Rejected(String),
-}
-
-/// The HUD and the Caps Lock light see the same dictation events. The HUD
-/// channel has one consumer; the light's model is fed beside each send
-/// instead of taking that channel over.
-#[derive(Clone, Copy)]
-struct DictationSink<'a> {
-    hud: Option<&'a DictationIndicatorSender>,
-    caps_lock: &'a crate::caps_lock_dictation::CapsLockDictation,
-}
-
-impl DictationSink<'_> {
-    fn send(&self, event: DictationIndicatorEvent) {
-        if let Some(hud) = self.hud {
-            hud.send(event.clone());
-        }
-        self.caps_lock.observe(event);
-    }
-
-    /// One chunk's loudness reaches both consumers: the light even when no
-    /// HUD listens, and the HUD exactly as it would have received it.
-    fn meter(&self, samples: &[f32]) {
-        if let Some(event) = DictationIndicatorEvent::meter(samples) {
-            self.send(event);
-        }
-    }
-
-    /// A non-dictation capture (Annotate) moves only the Caps Lock light, not
-    /// the dictation HUD.
-    #[cfg(hex_capture)]
-    fn caps_only(&self, event: DictationIndicatorEvent) {
-        self.caps_lock.observe(event);
-    }
-}
+use indicator::{DictationSink, sync_programmatic_indicator};
 
 #[derive(Debug)]
 pub enum RecognitionControl {
@@ -1123,18 +1086,6 @@ pub fn listen(
     Ok(())
 }
 
-fn sync_programmatic_indicator(
-    recording: bool,
-    previous: &mut bool,
-    indicator: DictationSink<'_>,
-) {
-    if recording == *previous {
-        return;
-    }
-    *previous = recording;
-    indicator.send(DictationIndicatorEvent::ProgrammaticRecording { recording });
-}
-
 fn log_programmatic_ended(active: Option<ProgrammaticDictation>, outcome: &str) {
     if let Some(active) = active {
         tracing::warn!(
@@ -1568,15 +1519,6 @@ fn fail_capture(
     emit_engine_state(events, false, worker, device)
 }
 
-#[derive(Clone, Copy)]
-enum CaptureEnd {
-    /// The capture never became a dictation; no feedback tone.
-    Discarded(Option<DiscardCause>),
-    /// The capture ended unfinished: the cancel shortcut, or Hex itself
-    /// when its shortcuts were suspended or the event tap was lost.
-    Cancelled,
-}
-
 /// Cancels the active capture before reporting the ending.
 fn end_capture(
     end: CaptureEnd,
@@ -1869,6 +1811,36 @@ mod tests {
         assert_eq!(press(OPTION_KEY_MASK, 7_000), [(DICTATION, FINISH)]);
         assert!(press(0, 7_100).is_empty());
         assert!(!hotkeys.any_recording());
+    }
+
+    #[test]
+    fn second_shortcut_latches_its_mode_and_other_starts_clear_it() {
+        let mut hotkeys = Hotkeys::new(
+            DictationHotkey::new(
+                CaptureInstant::now(),
+                false,
+                crate::app_settings::RuntimeHotkey::default(),
+            ),
+            DictationHotkey::new(
+                CaptureInstant::now(),
+                false,
+                crate::app_settings::RuntimeHotkey::default(),
+            ),
+        );
+        hotkeys.start_processing(Shortcut::Second, Some("Reword".into()));
+        assert_eq!(hotkeys.processing_mode().as_deref(), Some("Reword"));
+        assert_eq!(hotkeys.indicator_mode(Shortcut::Second), Some("Reword"));
+        hotkeys.start_processing(Shortcut::Dictation, Some("Ignored".into()));
+        assert!(hotkeys.processing_mode().is_none());
+        assert!(hotkeys.indicator_mode(Shortcut::Dictation).is_none());
+        hotkeys.start_processing(Shortcut::Raw, Some("Reword".into()));
+        assert!(hotkeys.raw_capture);
+        assert!(hotkeys.processing_mode().is_none());
+        hotkeys.start_processing(Shortcut::Second, None);
+        assert_eq!(
+            hotkeys.indicator_mode(Shortcut::Second),
+            Some("Second dictation shortcut")
+        );
     }
 
     /// A bound extra row's machine, as the listener configures it.

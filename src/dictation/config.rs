@@ -126,7 +126,13 @@ mod tests {
         let profiles = build_dictation_profiles(&settings);
         let context = ContextSnapshot::default();
         let process = |context: &ContextSnapshot| {
-            profiles.process_cancellable("Um, ship tomorrow.", context, &AtomicBool::new(false))
+            profiles.process_cancellable(
+                "Um, ship tomorrow.",
+                "en",
+                context,
+                &AtomicBool::new(false),
+                crate::dictation::processor::Source::Dictation,
+            )
         };
         assert_eq!(process(&context).text, "Ship tomorrow.");
         assert!(!profiles.processes(&context));
@@ -166,8 +172,10 @@ mod tests {
         // Cancellation before discovery avoids any live service/provider call.
         let processed = profiles.process_cancellable(
             "Um, we should uh ship it.",
+            "en",
             &context,
             &AtomicBool::new(true),
+            crate::dictation::processor::Source::Dictation,
         );
         crate::labs::apply(&crate::app_settings::LabsSettings::default());
         assert_eq!(processed.text, "We should send it.");

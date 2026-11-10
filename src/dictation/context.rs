@@ -354,6 +354,7 @@ impl ContextSnapshot {
                     browser_url: url,
                     window_title: title,
                     input_revision: None,
+                    processing_mode: None,
                 });
             }
         }

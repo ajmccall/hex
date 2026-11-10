@@ -500,6 +500,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mode_badge_follows_secondary_capture_through_processing_then_clears() {
+        let now = Instant::now();
+        let mut model = IndicatorModel::new(Tuning::default(), now);
+        model.handle(
+            DictationIndicatorEvent::StartedWithMode("Reword".into()),
+            now,
+            false,
+        );
+        assert_eq!(model.mode_badge(), Some("Reword"));
+        model.handle(DictationIndicatorEvent::Submitted { job_id: 1 }, now, false);
+        model.handle(
+            DictationIndicatorEvent::Processing { job_id: 1 },
+            now,
+            false,
+        );
+        assert_eq!(model.mode_badge(), Some("Reword"));
+        model.handle(
+            DictationIndicatorEvent::JobCompleted { job_id: 1 },
+            now,
+            false,
+        );
+        assert_eq!(model.mode_badge(), None);
+    }
+
+    #[test]
+    fn mode_badge_prioritizes_new_recording_and_masks_programmatic_capture() {
+        let now = Instant::now();
+        let mut model = IndicatorModel::new(Tuning::default(), now);
+        model.handle(
+            DictationIndicatorEvent::StartedWithMode("Reword".into()),
+            now,
+            false,
+        );
+        model.handle(DictationIndicatorEvent::Submitted { job_id: 1 }, now, false);
+        model.handle(DictationIndicatorEvent::Started, now, false);
+        assert_eq!(model.mode_badge(), None);
+        model.handle(DictationIndicatorEvent::Discarded, now, false);
+        assert_eq!(model.mode_badge(), Some("Reword"));
+        model.handle(
+            DictationIndicatorEvent::ProgrammaticRecording { recording: true },
+            now,
+            false,
+        );
+        assert_eq!(model.mode_badge(), None);
+        model.handle(
+            DictationIndicatorEvent::ProgrammaticRecording { recording: false },
+            now,
+            false,
+        );
+        assert_eq!(model.mode_badge(), Some("Reword"));
+    }
+
+    #[test]
     fn meter_reports_rms_and_peak() {
         let Some(DictationIndicatorEvent::Meter { average, peak }) =
             DictationIndicatorEvent::meter(&[-0.5, 0.5])
