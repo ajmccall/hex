@@ -1116,7 +1116,21 @@ final class DotScopeMetalPipeline {
     let device: MTLDevice
     let queue: MTLCommandQueue
     let scopePipeline: MTLRenderPipelineState
-    let swipePipeline: MTLRenderPipelineState?
+
+    private let vertexFunction: MTLFunction
+    private let swipeFragmentFunction: MTLFunction?
+    private var cachedSwipePipeline: MTLRenderPipelineState?
+    private var didAttemptSwipePipeline = false
+
+    /// Built on first use. Only the main app's home-indicator cue draws it, so
+    /// the keyboard extension never compiles a second render pipeline.
+    var swipePipeline: MTLRenderPipelineState? {
+        if !didAttemptSwipePipeline {
+            didAttemptSwipePipeline = true
+            cachedSwipePipeline = makeSwipePipeline()
+        }
+        return cachedSwipePipeline
+    }
 
     private init?() {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -1140,22 +1154,21 @@ final class DotScopeMetalPipeline {
             return nil
         }
 
-        let swipePipeline: MTLRenderPipelineState?
-        if let swipeFragment = library.makeFunction(name: "dot_swipe_cue_fragment") {
-            let swipeDesc = MTLRenderPipelineDescriptor()
-            swipeDesc.label = "Hex DotSwipeCue"
-            swipeDesc.vertexFunction = vertex
-            swipeDesc.fragmentFunction = swipeFragment
-            swipeDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
-            swipePipeline = try? device.makeRenderPipelineState(descriptor: swipeDesc)
-        } else {
-            swipePipeline = nil
-        }
-
         self.device = device
         self.queue = queue
         self.scopePipeline = scopePipeline
-        self.swipePipeline = swipePipeline
+        self.vertexFunction = vertex
+        self.swipeFragmentFunction = library.makeFunction(name: "dot_swipe_cue_fragment")
+    }
+
+    private func makeSwipePipeline() -> MTLRenderPipelineState? {
+        guard let swipeFragmentFunction = self.swipeFragmentFunction else { return nil }
+        let desc = MTLRenderPipelineDescriptor()
+        desc.label = "Hex DotSwipeCue"
+        desc.vertexFunction = vertexFunction
+        desc.fragmentFunction = swipeFragmentFunction
+        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        return try? device.makeRenderPipelineState(descriptor: desc)
     }
 }
 
@@ -1222,7 +1235,7 @@ final class DotScopeHostView: UIView {
         layer as! CAMetalLayer
     }
 
-    init(tuning: DotScopeTuning) {
+    init(tuning: DotScopeTuning, maximumDrawableCount: Int = 3) {
         self.requestedTuning = tuning
         self.simulation = DotScopeSimulation(tuning: tuning)
         if let gpu = DotScopeMetalPipeline.shared {
@@ -1245,13 +1258,21 @@ final class DotScopeHostView: UIView {
             metalLayer.isOpaque = false
             metalLayer.framebufferOnly = true
             metalLayer.allowsNextDrawableTimeout = false
-            metalLayer.maximumDrawableCount = 3
+            metalLayer.maximumDrawableCount = max(2, min(3, maximumDrawableCount))
             metalLayer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         }
 
         proxy.tickHandler = { [weak self] link in
             self?.stepAndRender(timestamp: link.timestamp, targetTimestamp: link.targetTimestamp)
         }
+    }
+
+    /// Releases the display link and shrinks Metal drawables so keyboard extensions reclaim IOSurfaces.
+    func tearDown() {
+        displayLink?.invalidate()
+        displayLink = nil
+        visibilityObservations.removeAll()
+        metalLayer.drawableSize = CGSize(width: 1, height: 1)
     }
 
     @available(*, unavailable)
@@ -1382,7 +1403,15 @@ final class DotScopeHostView: UIView {
         displayLink = link
     }
 
+    /// The idle pre-roll only exists so previews and snapshots open on a
+    /// settled scope. An app extension gets a tight memory budget and pays for
+    /// every main-thread millisecond at launch, so it skips the pre-roll.
+    private static var runsInAppExtension: Bool {
+        Bundle.main.bundlePath.hasSuffix(".appex")
+    }
+
     private func settleIdleImmediately() {
+        guard !Self.runsInAppExtension else { return }
         for _ in 0..<42 {
             simulation.advance(
                 dt: 1.0 / 60.0,

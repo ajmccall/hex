@@ -50,6 +50,12 @@ final class DictationController {
         let style: DictationStyle
         let usesCleanup: Bool
         let vocabularyTerms: [String]
+        /// Learn how I type's dictation fixes, read at start; empty while it is off.
+        let personalCorrections: [DictationCorrection]
+        /// Custom vocabulary plus the learned fixes' meant words, for Apple Speech.
+        let recognitionHints: [String]
+        /// Whether the keyboard gets the raw transcript to learn from.
+        let sharesHeard: Bool
         let copyToPasteboard: Bool
     }
 
@@ -65,6 +71,8 @@ final class DictationController {
     private let cleaner: (any TranscriptCleaning)?
     private let cleanupSettings: AppleIntelligenceCleanupSettings
     private let customVocabularySettings: CustomVocabularySettings
+    private let typingJournalSettings: TypingJournalSettings
+    private let learnedDictationCorrections: @MainActor () -> [DictationCorrection]
     private let audio: any AudioManaging
     private let keyboardBridge: KeyboardBridge
     private let fileManager: FileManager
@@ -86,6 +94,9 @@ final class DictationController {
     private var keyboardResultID: String?
     private var keyboardResultExpiresAt: TimeInterval?
     private var keyboardResult: String?
+    private var keyboardResultHeard: String?
+    /// Record typing logs: each step of the result, for the keyboard's log; nil while off.
+    private var keyboardResultStages: DictationStages?
     private var keyboardMessage: String?
     private var pendingHandoff: PendingKeyboardHandoff?
     private var keyboardSessionExpiresAt: TimeInterval = 0
@@ -149,7 +160,9 @@ final class DictationController {
         urlOpener: (@MainActor (URL) async -> Bool)? = nil,
         cleaner: (any TranscriptCleaning)? = nil,
         cleanupSettings: AppleIntelligenceCleanupSettings = AppleIntelligenceCleanupSettings(),
-        customVocabularySettings: CustomVocabularySettings = CustomVocabularySettings()
+        customVocabularySettings: CustomVocabularySettings = CustomVocabularySettings(),
+        typingJournalSettings: TypingJournalSettings = TypingJournalSettings(),
+        learnedDictationCorrections: (@MainActor () -> [DictationCorrection])? = nil
     ) {
         let resolvedBridge = keyboardBridge ?? KeyboardBridge()
         let resolvedAudio = audio ?? SystemAudioManager()
@@ -162,6 +175,10 @@ final class DictationController {
         self.cleaner = cleaner
         self.cleanupSettings = cleanupSettings
         self.customVocabularySettings = customVocabularySettings
+        self.typingJournalSettings = typingJournalSettings
+        self.learnedDictationCorrections = learnedDictationCorrections ?? {
+            TypingJournal.storedDictationCorrections(settings: typingJournalSettings)
+        }
         self.fileManager = fileManager
         self.now = now
         self.warmDuration = resolvedBridge.warmDuration
@@ -711,7 +728,14 @@ final class DictationController {
         transcriptionTask = nil
         let effectiveStyle = styleOverride ?? style
         let usesCleanup = cleanupSettings.isEnabled
+        CleanupTagger.prepareIfEnabled(style: effectiveStyle)
         let vocabularyTerms = customVocabularySettings.activeTerms
+        let personalCorrections = learnedDictationCorrections()
+        let recognitionHints = DictationCorrections.recognitionHints(
+            vocabulary: vocabularyTerms,
+            corrections: personalCorrections
+        )
+        let sharesHeard = typingJournalSettings.isEnabled
 
         phase = .requestingPermission
         copied = false
@@ -753,6 +777,9 @@ final class DictationController {
                     style: effectiveStyle,
                     usesCleanup: usesCleanup,
                     vocabularyTerms: vocabularyTerms,
+                    personalCorrections: personalCorrections,
+                    recognitionHints: recognitionHints,
+                    sharesHeard: sharesHeard,
                     copyToPasteboard: copyToPasteboard
                 )
                 refreshWarmExpiry()
@@ -816,25 +843,31 @@ final class DictationController {
             defer {
                 try? FileManager.default.removeItem(at: captureURL)
             }
+            let transcribeStarted = Date()
 
             do {
                 let rawText = try await activeTranscriber.transcribe(
                     captureURL,
-                    vocabulary: session.vocabularyTerms
+                    vocabulary: session.recognitionHints
                 )
                 guard let self, self.jobGeneration == captureGeneration, !Task.isCancelled else {
                     return
                 }
-                // Spelling runs before optional cleanup so cleanup sees the preferred
-                // words, then again after formatting because a style can lowercase a
-                // term or capitalize a sentence start ("iPhone" -> "IPhone").
-                let spelled = VocabularySpelling.apply(session.vocabularyTerms, to: rawText)
-                let text = await self.cleanedTranscriptIfEnabled(spelled, session: session)
+                // Learned fixes run first, on the words as heard. Spelling runs before
+                // optional cleanup so cleanup sees the preferred words, then again after
+                // formatting because a style can lowercase a term or capitalize a
+                // sentence start ("iPhone" -> "IPhone"); learned capitals get the same.
+                let corrected = DictationCorrections.apply(session.personalCorrections, to: rawText)
+                let spelled = VocabularySpelling.apply(session.vocabularyTerms, to: corrected)
+                let tagged = await CleanupTagger.cleanIfEnabled(spelled, style: session.style)
+                let cleaned = await self.cleanedTranscriptIfEnabled(tagged, session: session)
+                let translated = await DictationTranslator.translateIfEnabled(cleaned)
+                let text = translated ?? cleaned
                 guard self.jobGeneration == captureGeneration, !Task.isCancelled else {
                     return
                 }
                 let formatted = VocabularySpelling.apply(
-                    session.vocabularyTerms,
+                    session.vocabularyTerms + DictationCorrections.spellings(session.personalCorrections),
                     to: TranscriptFormatter.format(text, style: session.style)
                 )
                 self.recordingDuration = 0
@@ -850,6 +883,24 @@ final class DictationController {
                 if keyboardJobID != nil {
                     self.keyboardResultID = UUID().uuidString
                     self.keyboardResult = formatted
+                    // A translation's words can't be compared with what was heard.
+                    self.keyboardResultHeard = session.sharesHeard && translated == nil ? rawText : nil
+                    self.keyboardResultStages = TypingLogSettings().isEnabled
+                        ? DictationStages(
+                            engine: self.engineName,
+                            language: self.transcriptionLanguage,
+                            style: session.style.rawValue,
+                            recordedMS: Int((finalDuration * 1000).rounded()),
+                            transcribeMS: Int((Date().timeIntervalSince(transcribeStarted) * 1000).rounded()),
+                            raw: rawText,
+                            fixed: corrected,
+                            spelled: spelled,
+                            tagged: CleanupTaggerSettings().isEnabled && session.style != .verbatim ? tagged : nil,
+                            cleaned: session.usesCleanup && session.style != .verbatim ? cleaned : nil,
+                            translated: translated,
+                            formatted: formatted
+                        )
+                        : nil
                     self.keyboardResultExpiresAt = self.now() + Self.resultDeliveryTTL
                     self.keyboardMessage = nil
                 }
@@ -1031,6 +1082,8 @@ final class DictationController {
         if let expires = keyboardResultExpiresAt, expires <= currentTime {
             keyboardResultID = nil
             keyboardResult = nil
+            keyboardResultHeard = nil
+            keyboardResultStages = nil
             keyboardResultExpiresAt = nil
         }
 
@@ -1088,7 +1141,9 @@ final class DictationController {
                 resultID: keyboardResultID,
                 resultExpiresAt: keyboardResultExpiresAt,
                 transcript: keyboardResult,
-                message: failureMessage
+                message: failureMessage,
+                heard: keyboardResultHeard,
+                stages: keyboardResultStages
             )
         )
     }
@@ -1267,7 +1322,7 @@ final class DictationController {
         controller.isModelReady = true
 
         switch scene {
-        case "setup":
+        case "setup", _ where scene.hasPrefix("onboarding-"):
             controller.phase = .ready
             controller.warmDuration = .fifteenMinutes
             controller.keyboardSessionEnabled = false

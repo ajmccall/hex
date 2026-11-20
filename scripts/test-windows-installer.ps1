@@ -7,12 +7,16 @@
 #     -Executable dist\hex-2.4.0-windows-x64.exe -Console dist\hex-2.4.0-windows-x64.com -Version 2.4.0
 #
 # -Console (hex.com) is left out only for a release published before it.
+# -SignedEngine checks the installed uninstaller's Authenticode signature, its
+# timestamp, and that the release publisher signed it (Release signs the setup
+# engine; Test builds do not sign it).
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string]$Installer,
     [Parameter(Mandatory)] [string]$Executable,
     [string]$Console,
-    [Parameter(Mandatory)] [string]$Version
+    [Parameter(Mandatory)] [string]$Version,
+    [switch]$SignedEngine
 )
 $ErrorActionPreference = 'Stop'
 
@@ -65,6 +69,17 @@ Check ($entry.DisplayVersion -eq $Version) "Apps & Features shows $Version"
 $uninstaller = ($entry.UninstallString -replace '"', '')
 Check ($uninstaller -like "$support\uninstall\*") 'the uninstaller lives outside versions\, which updates prune'
 Check (Test-Path $uninstaller) 'the uninstaller exists'
+# The uninstaller is the setup engine, and the copy Setup extracts to %TEMP%
+# at launch is the same bytes: Smart App Control blocks an unsigned copy
+# (error 4551), so Release embeds a signed engine.
+if ($SignedEngine) {
+    $signature = Get-AuthenticodeSignature -LiteralPath $uninstaller
+    Check ($signature.Status -eq 'Valid') "the uninstaller has a valid Authenticode signature ($($signature.Status))"
+    Check ($null -ne $signature.TimeStamperCertificate) 'the uninstaller signature has an RFC 3161 timestamp'
+    Check ($signature.SignerCertificate.Subject -match 'Anomaly Innovations') "the uninstaller is signed by the release publisher ($($signature.SignerCertificate.Subject))"
+}
+function Run-Value { (Get-ItemProperty -Path $runKey -Name 'Hex' -ErrorAction SilentlyContinue).Hex }
+Check ($null -eq (Run-Value)) 'installing leaves Launch at login off'
 
 function User-Path { [Environment]::GetEnvironmentVariable('Path', 'User') }
 function Path-Has([string]$folder) {
@@ -101,16 +116,24 @@ if ($Console) {
     Check ($reported -eq $Version) "installed hex.exe reports $Version"
 }
 
+# A Launch at login value outside the managed layout is the user's.
+if (-not (Test-Path $runKey)) { New-Item -Path $runKey | Out-Null }
+$foreign = '"C:\Tools\hex.exe" app --hidden'
+Set-ItemProperty -Path $runKey -Name 'Hex' -Value $foreign
 Check ((Run-Setup 'reinstall') -eq 0) 'reinstalling the same version exits 0'
 Check ((Get-FileHash -Algorithm SHA256 $installed).Hash -eq $expected) 'reinstall keeps the release bytes'
+Check ((Run-Value) -eq $foreign) 'Setup leaves a Launch at login value outside versions\ alone'
 if ($Console) {
     Check (@((User-Path) -split ';' | Where-Object { $_.TrimEnd('\') -eq $bin }).Count -eq 1) 'reinstalling adds bin to PATH once'
 }
 
 # Versions are never compared: the installer installs its own over any other.
 Set-Content -Path $pointer -Value '99.0.0' -NoNewline
+# Launch at login as the version this replaces registered it.
+Set-ItemProperty -Path $runKey -Name 'Hex' -Value "`"$support\versions\99.0.0\hex.exe`" app --hidden"
 Check ((Run-Setup 'over-another') -eq 0) 'installing over another version exits 0'
 Check ((Get-Content $pointer -Raw).Trim() -eq $Version) 'current-version names this installer''s version'
+Check ((Run-Value) -eq "`"$installed`" app --hidden") "Launch at login now starts versions\$Version ($(Run-Value))"
 
 # Simulate what a self-update and Launch at login leave behind.
 $updated = Join-Path $support 'versions\99.0.0\hex.exe'

@@ -50,6 +50,21 @@ pub fn directory(history: &Path) -> PathBuf {
     history.with_file_name(DIRECTORY)
 }
 
+/// Puts `path` on the clipboard as a file, so a paste into an app that takes
+/// files (a chat, an agent, Finder or Explorer) attaches it (Labs › Copy
+/// dictation audio). This only copies a WAV Keep recordings already wrote; it
+/// never stores audio itself.
+pub fn copy_to_clipboard(path: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    scrawl_capture::handoff::copy_file_to_clipboard(path)?;
+    #[cfg(target_os = "windows")]
+    scrawl_capture::win::clipboard::set_file(path)?;
+    #[cfg(target_os = "linux")]
+    crate::linux::paste::with_paster(|paster| paster.copy_file_uri(path))
+        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+    Ok(())
+}
+
 pub(super) fn path(directory: &Path, id: u64) -> PathBuf {
     directory.join(format!("{id}.wav"))
 }
@@ -137,7 +152,12 @@ pub fn retranscribe(path: &Path, selection: TranscriptionSelection) -> Result<St
         .admit_audio()
         .ok_or_else(|| "Another transcription is running.".to_string())?;
     let result = handle
-        .transcribe(selection, clip, admission)
+        .transcribe(
+            selection,
+            clip,
+            admission,
+            crate::transcription::transcript::TimestampLevel::None,
+        )
         .map_err(describe)
         .and_then(|job| match job.wait_timeout(RETRANSCRIBE_DEADLINE) {
             Ok(Some(result)) => result.map_err(describe),
@@ -148,7 +168,7 @@ pub fn retranscribe(path: &Path, selection: TranscriptionSelection) -> Result<St
     // keeping it would make the shutdown wait forever after the result.
     drop(handle);
     service.shutdown();
-    result.map(|text| text.trim().to_string())
+    result.map(|transcript| transcript.text.trim().to_string())
 }
 
 fn describe(error: TranscriptionServiceError) -> String {
@@ -156,6 +176,7 @@ fn describe(error: TranscriptionServiceError) -> String {
         TranscriptionServiceError::QueueFull => "Another transcription is running.".into(),
         TranscriptionServiceError::Unavailable => "Transcription stopped.".into(),
         TranscriptionServiceError::Cancelled => "Transcription was cancelled.".into(),
+        TranscriptionServiceError::Timestamps => "The model cannot give these timings.".into(),
         TranscriptionServiceError::Model(error) | TranscriptionServiceError::Inference(error) => {
             error
         }

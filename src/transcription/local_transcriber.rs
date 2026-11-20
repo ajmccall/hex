@@ -11,7 +11,7 @@ use crate::transcription::gpu_health;
 use crate::transcription::models::{
     TranscriptionModelId, TranscriptionSelection, download_with_progress, model_path, validate,
 };
-use crate::transcription::{pad_gguf_samples, trailing_silence_samples};
+use crate::transcription::{pad_gguf_samples, requires_closing_mark, trailing_silence_samples};
 
 /// A word or segment's start and end (ms from the clip's start) and text.
 pub type TimedSpan = (i64, i64, String);
@@ -35,6 +35,9 @@ pub struct LocalTranscriber {
     /// It loaded on the CPU because the GPU ran out of memory, as it does
     /// when another copy of a model already fills it (#1170).
     gpu_full: bool,
+    /// The GPU out-of-memory fallback it took mid-run, for the dictation
+    /// engine to publish in Settings (#1984). Not saved.
+    out_of_memory: Option<gpu_health::Failure>,
 }
 
 /// 1.5 s of silence: what loading runs to warm a model and time it.
@@ -212,12 +215,6 @@ pub fn transcribe_wav_with_selection(
     selection: &TranscriptionSelection,
 ) -> Result<String> {
     let samples = read_wav_for_parakeet(path)?;
-    LocalTranscriber::load(selection)?.transcribe(&samples)
-}
-
-/// A WAV already in memory, as `hex transcribe` read it.
-pub fn transcribe_wav_bytes(wav: &[u8], selection: &TranscriptionSelection) -> Result<String> {
-    let samples = read_wav(std::io::Cursor::new(wav))?;
     LocalTranscriber::load(selection)?.transcribe(&samples)
 }
 
@@ -408,6 +405,7 @@ impl LocalTranscriber {
             preference,
             warm_ms: 0,
             gpu_full: false,
+            out_of_memory: None,
         };
         let started = Instant::now();
         transcriber.warm_on_silence()?;
@@ -466,6 +464,13 @@ impl LocalTranscriber {
         trailing_silence_samples(Some(self.model_id()))
     }
 
+    /// Whether a live stream of this model must end its text with closing
+    /// sentence punctuation before it is trusted, as Unified English's does
+    /// (issue 1933).
+    pub(crate) fn stream_requires_closing_mark(&self) -> bool {
+        requires_closing_mark(Some(self.model_id()))
+    }
+
     /// The model this transcriber was loaded for.
     pub(crate) fn model_id(&self) -> TranscriptionModelId {
         self.selection.model
@@ -491,6 +496,12 @@ impl LocalTranscriber {
         &self.selection == selection
     }
 
+    /// The out-of-memory fallback this model took, for the dictation engine
+    /// to publish in Settings (#1984). `None` on a GPU.
+    pub(crate) fn out_of_memory(&self) -> Option<&gpu_health::Failure> {
+        self.out_of_memory.as_ref()
+    }
+
     /// Brings an idle model's weights back before audio arrives, as loading
     /// does; a model that ran recently is already warm.
     pub(crate) fn prewarm(&mut self) -> Result<()> {
@@ -506,6 +517,37 @@ impl LocalTranscriber {
     pub(crate) fn transcribe_clip(&mut self, mut samples: Vec<f32>) -> Result<String> {
         pad_gguf_samples(&mut samples, Some(self.model_id()));
         self.transcribe(&samples)
+    }
+
+    /// [`Self::transcribe_clip`] with the model's own segment and word times,
+    /// chunked and padded exactly as the untimed run chunks and pads it, so
+    /// the text matches and each chunk's times sit on the clip's timeline.
+    pub(crate) fn transcribe_timed(
+        &mut self,
+        mut samples: Vec<f32>,
+    ) -> Result<crate::transcription::transcript::Transcript> {
+        pad_gguf_samples(&mut samples, Some(self.model_id()));
+        let options = RunOptions {
+            timestamps: self.finest_timestamps,
+            ..self.options.clone()
+        };
+        match self
+            .session
+            .transcribe_chunked_timed(&samples, &options, self.max_audio_samples)
+        {
+            Err(error) if self.gpu_failed(&error) => {
+                self.recover_on_cpu(&error)?;
+                self.session
+                    .transcribe_chunked_timed(&samples, &options, self.max_audio_samples)
+            }
+            result => result,
+        }
+    }
+
+    /// The finest native timings this model gives, as a timed request needs
+    /// them. Never the level a caller asked for.
+    pub(crate) fn timestamps(&self) -> crate::transcription::transcript::TimestampLevel {
+        crate::transcription::gguf_session::timestamp_level(self.finest_timestamps)
     }
 
     pub fn device_label(&self) -> &str {
@@ -601,18 +643,24 @@ impl LocalTranscriber {
 
     /// Reloads this model on the CPU after its GPU failed mid-run (a hang
     /// or reset comes back as an error, #856), remembering the GPU once the
-    /// CPU works.
+    /// CPU works. An out-of-memory failure is carried by the CPU model for
+    /// the dictation engine to show in Settings (#1984).
     fn recover_on_cpu(&mut self, error: &color_eyre::eyre::Report) -> Result<()> {
         tracing::warn!(
             error = format!("{error:#}"),
             "the GPU failed while transcribing; reloading the model on the CPU"
         );
         let gpu = self.gpu.take();
-        let cpu = Self::load_on(&self.selection, Backend::Cpu, None, self.preference)?;
-        if let Some(gpu) = &gpu
-            && !gpu_health::out_of_memory(error)
-        {
-            gpu_health::record(gpu, &format!("{error:#}"));
+        let mut cpu = Self::load_on(&self.selection, Backend::Cpu, None, self.preference)?;
+        if let Some(gpu) = &gpu {
+            if gpu_health::out_of_memory(error) {
+                cpu.out_of_memory = Some(gpu_health::out_of_memory_failure(
+                    gpu,
+                    &format!("{error:#}"),
+                ));
+            } else {
+                gpu_health::record(gpu, &format!("{error:#}"));
+            }
         }
         gpu_health::set_auto_on_cpu(self.preference == TranscriptionDevice::Auto);
         *self = cpu;
@@ -623,6 +671,7 @@ impl LocalTranscriber {
         &mut self,
         samples: &[f32],
     ) -> Result<crate::transcription::transcript::Transcript> {
+        use crate::transcription::gguf_session::{chunk_ranges, sample_offset_ms};
         use crate::transcription::transcript::TranscriptSegment;
         const CHUNK: usize = 30 * 16_000;
         let chunk = self.max_audio_samples.map_or(CHUNK, |max| max.min(CHUNK));
@@ -640,11 +689,11 @@ impl LocalTranscriber {
         };
         let mut timed = crate::transcription::transcript::Transcript::default();
         let mut texts = Vec::new();
-        for (index, part) in samples.chunks(chunk.max(1)).enumerate() {
-            let offset = (index * chunk / 16) as i64;
+        for range in chunk_ranges(samples, chunk) {
+            let offset = sample_offset_ms(range.start);
             let transcript = self
                 .session
-                .run(part, &options)
+                .run(&samples[range], &options)
                 .wrap_err("transcription failed")?;
             let text = transcript.text.trim();
             if !text.is_empty() {

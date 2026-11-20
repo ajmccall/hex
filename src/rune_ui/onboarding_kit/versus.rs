@@ -293,6 +293,7 @@ pub(super) fn view(p: Paint, s: &Onboard) -> Vec<El> {
             middle().pb(TOP_BAR).child(ready(
                 p,
                 &s.caps,
+                s.toggle,
                 None,
                 s.ready_age(),
                 s.reduced.get(),
@@ -867,6 +868,7 @@ fn room(script: &'static Script<'static>, title: &'static str) -> Notice {
         key: "room",
         app: App::Messages,
         from: title,
+        person: None,
         place: script.group,
         body: "",
         field: "iMessage",

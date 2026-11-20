@@ -13,12 +13,14 @@
 //! recording then lands on the same card ([`recording`]).
 
 pub(crate) mod narration;
+mod picker;
 mod recording;
 pub(crate) mod save;
 pub(crate) mod system_shortcut;
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::app_settings::RuntimeHotkey;
 use crate::capture_host::{CaptureNeed, CaptureTarget};
@@ -34,13 +36,48 @@ struct Overlays {
 
 static OVERLAYS: OnceLock<Overlays> = OnceLock::new();
 /// While the picker shows, the tap hands it Escape and Space.
-static PICKING: AtomicBool = AtomicBool::new(false);
-/// Whether it picks a window rather than an area.
-static WINDOW_MODE: AtomicBool = AtomicBool::new(false);
-/// Whether the open picker records what it picks rather than shooting it.
-static RECORDING: AtomicBool = AtomicBool::new(false);
+static PICKER: Mutex<picker::Picker> = Mutex::new(picker::Picker::new());
 /// The picker's window, left out of the shot; 0 before it's made.
 static PICKER_WINDOW: AtomicU32 = AtomicU32::new(0);
+/// The folder the last shot, recording, or editor save couldn't be written
+/// to and why, which Labs › Screenshots' card names until a save works or
+/// another folder is chosen. It keeps its own folder: the setting may have
+/// changed since through `hex settings` or `settings.json`.
+static SAVE_ERROR: Mutex<Option<(PathBuf, String)>> = Mutex::new(None);
+/// How many times [`SAVE_ERROR`] was recorded or cleared. A window's poll
+/// that reports nothing redraws nothing, so the card compares this count
+/// with the one it last drew and reports the difference.
+static SAVE_ERROR_CHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// The last failed save's folder and reason, for the card.
+pub(crate) fn save_error() -> Option<(PathBuf, String)> {
+    SAVE_ERROR
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+/// How many times the last failed save changed: a save recorded an error or
+/// cleared one.
+pub(crate) fn save_error_generation() -> u64 {
+    SAVE_ERROR_CHANGES.load(Ordering::Relaxed)
+}
+
+/// Forgets the last failed save: a later one saved fine, or the folder
+/// changed.
+pub(crate) fn clear_save_error() {
+    *SAVE_ERROR.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    SAVE_ERROR_CHANGES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Remembers a failed save of `folder` for the card, bounded so a long path
+/// can't grow the note without limit.
+pub(crate) fn record_save_error(folder: &Path, error: &anyhow::Error) {
+    let bounded: String = error.to_string().chars().take(300).collect();
+    *SAVE_ERROR.lock().unwrap_or_else(|error| error.into_inner()) =
+        Some((folder.to_path_buf(), bounded));
+    SAVE_ERROR_CHANGES.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Adds the screenshot picker, thumbnail, and editor, hidden. They're made at
 /// launch only while the Lab is on then.
@@ -95,24 +132,24 @@ pub(crate) fn open(record: bool) -> bool {
     if !crate::labs::screenshots() || OVERLAYS.get().is_none() {
         return false;
     }
-    if PICKING.swap(true, Ordering::AcqRel) {
+    let Some(id) = PICKER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .begin(record)
+    else {
         return false;
-    }
-    WINDOW_MODE.store(false, Ordering::Release);
-    RECORDING.store(record, Ordering::Release);
-    if let Some(overlays) = OVERLAYS.get() {
-        overlays.picker.set_screen_label(if record {
-            crate::desktop::i18n::tr("Full screen · Click to record")
-        } else {
-            crate::desktop::i18n::tr("Full screen · Click to capture")
-        });
-    }
+    };
     // Off the tap's thread: a fresh Screen Recording read may take a moment.
     let spawned = std::thread::Builder::new()
         .name("hex-screenshot-open".into())
         .spawn(move || {
-            if crate::capture_host::permission_state(CaptureNeed::ScreenRecording, true).is_some() {
-                PICKING.store(false, Ordering::Release);
+            let allowed =
+                crate::capture_host::permission_state(CaptureNeed::ScreenRecording, true).is_none();
+            let mut picker = PICKER.lock().unwrap_or_else(|e| e.into_inner());
+            if !picker.permission(id, allowed) {
+                return;
+            }
+            if !allowed {
                 tracing::info!("screenshot needs Screen Recording");
                 // The helper returns here, to the picker, once it's granted:
                 // never to Annotate's whole-screen recording.
@@ -122,10 +159,20 @@ pub(crate) fn open(record: bool) -> bool {
                 );
                 return;
             }
-            show(Some(Mode::Area));
+            if let Some(overlays) = OVERLAYS.get() {
+                overlays.picker.set_screen_label(if record {
+                    crate::desktop::i18n::tr("Full screen · Click to record")
+                } else {
+                    crate::desktop::i18n::tr("Full screen · Click to capture")
+                });
+            }
+            show(id, Some(Mode::Area));
         });
     if spawned.is_err() {
-        PICKING.store(false, Ordering::Release);
+        PICKER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .permission(id, false);
     }
     spawned.is_ok()
 }
@@ -147,23 +194,48 @@ pub(crate) fn can_restore() -> bool {
 
 /// Closes the picker without a shot.
 pub(crate) fn cancel() {
-    PICKING.store(false, Ordering::Release);
-    show(None);
+    let mut picker = PICKER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pick) = picker.active.take() {
+        show(pick.id, None);
+    }
 }
 
 /// Switches the open picker between an area and a window.
 fn toggle() {
-    let window = !WINDOW_MODE.fetch_xor(true, Ordering::AcqRel);
-    show(Some(if window { Mode::Window } else { Mode::Area }));
+    let mut picker = PICKER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pick) = picker.active.as_mut().filter(|pick| pick.ready) {
+        pick.window = !pick.window;
+        show(
+            pick.id,
+            Some(if pick.window {
+                Mode::Window
+            } else {
+                Mode::Area
+            }),
+        );
+    }
 }
 
 pub(crate) fn picking() -> bool {
-    PICKING.load(Ordering::Acquire)
+    PICKER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .active
+        .is_some()
 }
 
-fn show(mode: Option<Mode>) {
+fn show(id: u64, mode: Option<Mode>) {
     if let Some(overlays) = OVERLAYS.get() {
-        overlays.picker.set(mode);
+        overlays.picker.set_if(mode, move || {
+            let picker = PICKER.lock().unwrap_or_else(|e| e.into_inner());
+            if mode.is_some() {
+                picker.current(id)
+            } else {
+                // Hide is enqueued under the same lock as every show, before
+                // a later opening can queue its show (even while it waits for permission).
+                true
+            }
+        });
     }
 }
 
@@ -173,8 +245,16 @@ fn picked(action: Action) {
     let Action::Start(target) = action else {
         return;
     };
-    cancel();
-    if RECORDING.swap(false, Ordering::AcqRel) {
+    let record = {
+        let mut picker = PICKER.lock().unwrap_or_else(|e| e.into_inner());
+        if !picker.active.as_ref().is_some_and(|pick| pick.ready) {
+            return;
+        }
+        let pick = picker.active.take().unwrap();
+        show(pick.id, None);
+        pick.record
+    };
+    if record {
         let clip = crate::capture_host::CaptureControl::Command(
             crate::capture_host::CaptureCommand::Clip(target),
         );
@@ -217,8 +297,16 @@ fn take(target: CaptureTarget) -> anyhow::Result<std::path::PathBuf> {
     let png = save::encode(image.width, image.height, &image.rgba, scale)?;
     let folder = crate::app_settings::screenshot_settings().folder();
     let path = save::write(&folder, &png);
-    if let Err(error) = &path {
-        tracing::warn!(%error, folder = %folder.display(), "could not save the screenshot");
+    match &path {
+        Ok(_) => {
+            // The shot reached the folder this time, even if the clipboard
+            // copy below fails.
+            clear_save_error();
+        }
+        Err(error) => {
+            tracing::warn!(%error, folder = %folder.display(), "could not save the screenshot");
+            record_save_error(&folder, error);
+        }
     }
     save::copy(&png, path.as_deref().ok())?;
     let path = path?;
@@ -286,11 +374,30 @@ fn remember(capture: Remembered, (width, height, rgba): (u32, u32, &[u8])) {
 
 /// What was said over the shot saved at `file` in the editor, for
 /// Captures' search. Off the caller's thread.
-pub(crate) fn remember_words(file: std::path::PathBuf, words: String) {
-    let spawned = std::thread::Builder::new()
-        .name("hex-capture-words".into())
-        .spawn(move || captures::set_words(&file, &words));
-    if let Err(error) = spawned {
+pub(crate) fn append_words(file: std::path::PathBuf, words: String) {
+    use std::sync::mpsc::{SyncSender, sync_channel};
+    type Words = (std::path::PathBuf, String);
+    static WRITER: OnceLock<Option<SyncSender<Words>>> = OnceLock::new();
+    let writer = WRITER.get_or_init(|| {
+        let (send, receive) = sync_channel::<Words>(32);
+        match std::thread::Builder::new()
+            .name("hex-capture-words".into())
+            .spawn(move || {
+                // Preserve the UI's append order without doing disk I/O there.
+                for (file, words) in receive {
+                    captures::append_words(&file, &words);
+                }
+            }) {
+            Ok(_) => Some(send),
+            Err(error) => {
+                tracing::warn!(%error, "could not start the capture words writer");
+                None
+            }
+        }
+    });
+    if let Some(writer) = writer
+        && let Err(error) = writer.try_send((file, words))
+    {
         tracing::warn!(%error, "could not keep the words said over the shot");
     }
 }
@@ -498,7 +605,7 @@ impl Taken {
         shortcuts: Shortcuts,
         picking: bool,
         card: bool,
-        recording_shortcut: bool,
+        suspended: bool,
     ) -> (Take, Effect) {
         let Some(bit) = 1u128.checked_shl(u32::from(key.code)) else {
             return (Take::No, Effect::None);
@@ -513,7 +620,7 @@ impl Taken {
             self.0 &= !bit;
             return (if ours { take } else { Take::No }, Effect::None);
         }
-        if recording_shortcut {
+        if suspended {
             return (Take::No, Effect::None);
         }
         let pressed = |hotkey: Option<RuntimeHotkey>| {
@@ -565,7 +672,7 @@ pub(crate) fn key(key: Key) -> Take {
         shortcuts,
         picking,
         crate::rune_ui::screenshot_thumbnail::hovered(),
-        crate::app_settings::hotkey_capture_active(),
+        crate::app_settings::shortcuts_suspended(),
     );
     drop(taken);
     match effect {

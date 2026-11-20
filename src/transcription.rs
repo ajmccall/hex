@@ -1,3 +1,4 @@
+pub(crate) mod app_model_switching;
 pub(crate) mod artifacts;
 pub(crate) mod background_priority;
 #[cfg(target_os = "macos")]
@@ -9,6 +10,7 @@ pub(crate) mod benchmark;
 pub(crate) mod cpu_floor;
 pub(crate) mod custom_models;
 pub(crate) mod engine;
+pub(crate) mod file_transcript;
 pub(crate) mod found_models;
 pub(crate) mod gguf_header;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -23,6 +25,7 @@ pub(crate) mod model_benchmarks;
 pub(crate) mod model_details;
 pub(crate) mod models;
 pub(crate) mod pause_segmenter;
+pub(crate) mod pieces;
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 pub(crate) mod preparation;
 pub(crate) mod service;
@@ -141,6 +144,28 @@ impl Transcriber {
             Self::AppleSpeech(model) => model.transcribe(&samples),
         }
     }
+
+    /// A complete clip with its native timings, padded exactly as
+    /// [`Self::transcribe`] pads it so the text matches an untimed request.
+    pub fn transcribe_timed(&mut self, mut samples: Vec<f32>) -> Result<Transcript> {
+        match self {
+            Self::Gguf(model) => {
+                pad_gguf_samples(&mut samples, model.model_id());
+                model.transcribe_timed(&samples)
+            }
+            // Apple Speech segments the whole clip itself.
+            Self::AppleSpeech(model) => model.transcribe(&samples),
+        }
+    }
+
+    /// The finest native timings this backend gives: Apple Speech segments,
+    /// and a GGUF model what its metadata advertises.
+    pub fn timestamps(&self) -> crate::transcription::transcript::TimestampLevel {
+        match self {
+            Self::Gguf(model) => model.timestamps(),
+            Self::AppleSpeech(_) => crate::transcription::transcript::TimestampLevel::Segment,
+        }
+    }
 }
 
 /// Pads a GGUF clip as dictation prepares it on every OS: the backend's
@@ -158,6 +183,13 @@ pub(crate) fn trailing_silence_samples(model: Option<TranscriptionModelId>) -> u
     } else {
         0
     }
+}
+
+/// Whether a live stream of `model` must end its text with closing sentence
+/// punctuation before it is trusted: Unified English's chunked decode drops
+/// the mark its whole-clip run keeps (issue 1933).
+pub(crate) fn requires_closing_mark(model: Option<TranscriptionModelId>) -> bool {
+    model == Some(TranscriptionModelId::ParakeetUnifiedEnglish)
 }
 
 #[cfg(target_os = "macos")]
@@ -190,6 +222,16 @@ impl WarmTranscriber {
         match &self.active {
             Some(Transcriber::Gguf(model)) => trailing_silence_samples(model.model_id()),
             _ => 0,
+        }
+    }
+
+    /// Whether a live stream of the warm model must end its text with closing
+    /// sentence punctuation before it is trusted, as Unified English's does
+    /// (issue 1933).
+    pub(crate) fn stream_requires_closing_mark(&self) -> bool {
+        match &self.active {
+            Some(Transcriber::Gguf(model)) => requires_closing_mark(model.model_id()),
+            _ => false,
         }
     }
 
@@ -300,5 +342,25 @@ mod padding_tests {
         );
         assert!(samples[..1_600].iter().all(|sample| *sample == 0.5));
         assert!(samples[1_600..].iter().all(|sample| *sample == 0.0));
+    }
+}
+
+#[cfg(test)]
+mod closing_mark_tests {
+    use super::requires_closing_mark;
+    use crate::transcription::models::{CustomModelId, TranscriptionModelId};
+
+    #[test]
+    fn only_unified_english_streams_require_a_closing_mark() {
+        assert!(requires_closing_mark(Some(
+            TranscriptionModelId::ParakeetUnifiedEnglish
+        )));
+        assert!(!requires_closing_mark(None));
+        assert!(!requires_closing_mark(Some(
+            TranscriptionModelId::ParakeetV2
+        )));
+        assert!(!requires_closing_mark(Some(TranscriptionModelId::Custom(
+            CustomModelId::parse("custom-0123456789abcdef").expect("16 hex digits")
+        ))));
     }
 }

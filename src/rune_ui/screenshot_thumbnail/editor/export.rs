@@ -83,18 +83,30 @@ pub(super) struct Export {
     pub(super) crop: Option<Rect>,
 }
 
+/// The marks couldn't be drawn over the shot, so nothing left the editor:
+/// a shot never goes out without the marks its preview shows.
+#[derive(Debug)]
+pub(super) struct MarksNotDrawn(pub(super) anyhow::Error);
+
+impl std::fmt::Display for MarksNotDrawn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not draw the marks: {:#}", self.0)
+    }
+}
+
+impl std::error::Error for MarksNotDrawn {}
+
 impl Export {
     /// The edited shot as a PNG: cropped, with its marks drawn as the
-    /// editor draws them, at the shot's own pixels.
+    /// editor draws them, at the shot's own pixels. When the marks can't
+    /// be drawn it fails with [`MarksNotDrawn`] rather than give the shot
+    /// without them.
     pub(super) fn png(&self) -> anyhow::Result<Vec<u8>> {
         let rect = marks::pixel_rect(self.crop, self.size);
         let rgba = if self.marks.is_empty() {
             marks::crop(&self.rgba, self.size[0], rect)
         } else {
-            self.render(rect).unwrap_or_else(|error| {
-                tracing::warn!(%error, "exporting the screenshot without its marks");
-                marks::crop(&self.rgba, self.size[0], rect)
-            })
+            self.render(rect).map_err(MarksNotDrawn)?
         };
         encode(rect[2], rect[3], &rgba, self.scale)
     }
@@ -159,7 +171,12 @@ pub(super) fn deliver(out: &Out, png: &[u8], words: &str) -> anyhow::Result<()> 
         Out::Copy => save::copy(png, None),
         Out::Save => {
             let folder = crate::app_settings::screenshot_settings().folder();
-            save::write(&folder, png).map(|_| ())
+            let written = save::write(&folder, png);
+            match &written {
+                Ok(_) => crate::screenshots::clear_save_error(),
+                Err(error) => crate::screenshots::record_save_error(&folder, error),
+            }
+            written.map(|_| ())
         }
         Out::Send(dest) => {
             let folder = std::env::temp_dir().join("hex-screenshots");
@@ -197,7 +214,13 @@ impl ClipExport {
             Out::Copy => anyhow::bail!("a recording isn't copied"),
             Out::Save => {
                 let folder = crate::app_settings::screenshot_settings().folder();
-                super::clip::write_span(&self.movie, self.trim, &save::recording_path(&folder))
+                let written =
+                    super::clip::write_span(&self.movie, self.trim, &save::recording_path(&folder));
+                match &written {
+                    Ok(()) => crate::screenshots::clear_save_error(),
+                    Err(error) => crate::screenshots::record_save_error(&folder, error),
+                }
+                written
             }
             Out::Send(dest) => {
                 // The whole recording is already saved; only a cut is new.

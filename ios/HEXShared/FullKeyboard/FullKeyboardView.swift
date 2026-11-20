@@ -1,9 +1,9 @@
 import Combine
 import UIKit
 
-/// The experimental full keyboard: a strip, QWERTY keys with the Hex key right of space,
-/// and the recording panel that replaces both while Hex records. Dictation state comes
-/// from the same `KeyboardViewModel` the dictation bar uses.
+/// The experimental full keyboard: a 3-slot suggestion strip, QWERTY keys with the Hex key
+/// right of space, long-press accents, and the recording panel that replaces both while Hex records.
+/// Dictation state comes from the same `KeyboardViewModel` the dictation bar uses.
 @MainActor
 final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
     let model: KeyboardViewModel
@@ -19,14 +19,22 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
     var allowsHaptics: () -> Bool = { false }
     /// Draws a stand-in backdrop where there is no system keyboard behind the view.
     var drawsBackdrop = false { didSet { applyAppearance() } }
+    /// The keys typed, deleted, or pasted something (Learn how I type follows dictations).
+    var onTextEdit: (() -> Void)?
+    /// Undo dictation took the last dictation back.
+    var onUndoDictation: (() -> Void)?
+    /// The return key is about to type its line break.
+    var onReturnKey: (() -> Void)?
 
-    private let plane: KeyboardKeyPlaneView
+    private let stripView = KeyboardStripView()
+    /// The keys' touch surface; tests feed it touch samples.
+    let plane: KeyboardKeyPlaneView
     private let callout = KeyCalloutView()
+    private let accentCallout = AccentCalloutView()
     private let hexKey = HexKeyControl()
     private let globeButton = UIButton(type: .custom)
-    private let strip = UIView()
-    private let undoChip = UIButton(type: .custom)
-    private let stripLabel = UILabel()
+    /// The capsule that grows from the Hex mark across the strip into the recording bar.
+    private let morph = UIView()
     private var recordingPanel: HexKeyRecordingPanel?
     private var styleMenu: HexStyleMenuView?
     private var palette = FullKeyboardPalette(isDark: false)
@@ -36,43 +44,50 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
     private var lastDictation: String?
     private var undoHideWork: DispatchWorkItem?
     private let haptics = UIImpactFeedbackGenerator(style: .light)
+    private let selectionHaptics = UISelectionFeedbackGenerator()
+    private let clipboard = KeyboardClipboardTracker()
 
-    init(model: KeyboardViewModel, target: KeyboardTextTarget) {
+    /// Exposed so unit tests can verify lazy allocation and teardown of the Metal recording panel.
+    var hasAllocatedRecordingPanel: Bool { recordingPanel != nil }
+
+    init(model: KeyboardViewModel, target: KeyboardTextTarget, autocorrect: AutocorrectEngine? = nil) {
         self.model = model
-        engine = FullKeyboardEngine(target: target)
+        engine = FullKeyboardEngine(target: target, autocorrect: autocorrect)
         plane = KeyboardKeyPlaneView(engine: engine)
         super.init(frame: .zero)
         backgroundColor = .clear
 
-        addSubview(strip)
+        addSubview(stripView)
+        morph.isUserInteractionEnabled = false
+        morph.isHidden = true
+        addSubview(morph)
         addSubview(plane)
         addSubview(hexKey)
         addSubview(globeButton)
         addSubview(callout)
+        addSubview(accentCallout)
+        accentCallout.isHidden = true
 
-        stripLabel.font = .systemFont(ofSize: 14)
-        stripLabel.textAlignment = .center
-        stripLabel.adjustsFontSizeToFitWidth = true
-        stripLabel.minimumScaleFactor = 0.8
-        strip.addSubview(stripLabel)
-
-        var chip = UIButton.Configuration.plain()
-        chip.image = UIImage(systemName: "arrow.uturn.backward", withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .medium))
-        chip.imagePadding = 6
-        chip.title = "Undo dictation"
-        chip.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 14, bottom: 0, trailing: 14)
-        chip.background.cornerRadius = 17
-        undoChip.configuration = chip
-        undoChip.isHidden = true
-        undoChip.addTarget(self, action: #selector(undoDictation), for: .touchUpInside)
-        strip.addSubview(undoChip)
+        stripView.onSelectSuggestion = { [weak self] suggestion in
+            guard let self else { return }
+            self.keyFeedback()
+            self.engine.acceptSuggestion(suggestion)
+        }
+        stripView.onUndoDictation = { [weak self] in self?.undoDictation() }
+        stripView.onPaste = { [weak self] in self?.pasteFromClipboard() }
+        stripView.onNextKeyboard = { [weak self] in
+            self?.typingLog?.ui("next_keyboard")
+            self?.hostController?.advanceToNextInputMode()
+        }
 
         globeButton.accessibilityLabel = "Next keyboard"
         globeButton.isAccessibilityElement = true
+        globeButton.addTarget(self, action: #selector(globeTapped), for: .touchUpInside)
 
         hexKey.onHold = { [weak self] in self?.hexKeyHeld() }
         hexKey.onMenuOpen = { [weak self] point in
             guard let self else { return }
+            self.typingLog?.ui("hex_menu")
             self.showStyleMenu()
             self.forwardMenuPoint(point, release: false)
         }
@@ -80,8 +95,16 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
         hexKey.onMenuRelease = { [weak self] point in self?.forwardMenuPoint(point, release: true) }
 
         plane.onKeyDown = { [weak self] _ in self?.keyFeedback() }
+        plane.onAccentMenuOpened = { [weak self] in self?.selectionFeedback() }
+        engine.onSelectionStep = { [weak self] in self?.selectionFeedback() }
         engine.onChange = { [weak self] in self?.engineChanged() }
-        engine.onEdit = { [weak self] in self?.hideUndo() }
+        engine.onEdit = { [weak self] in
+            self?.hideUndo()
+            self?.refreshReturnKey()
+            self?.refreshStrip()
+            self?.onTextEdit?()
+        }
+        engine.onReturn = { [weak self] in self?.onReturnKey?() }
 
         model.objectWillChange
             .receive(on: RunLoop.main)
@@ -97,6 +120,8 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
             view.setNeedsLayout()
         }
 
+        engine.autocorrect.isEnabled = FullKeyboardSettings().autocorrect
+        engine.showsKeyPopups = FullKeyboardSettings().keyPopups
         engine.configureForField()
         applyAppearance()
         refreshFromModel()
@@ -104,6 +129,28 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
+
+    // MARK: - Typing logs
+
+    /// Record typing logs (Experiments): set by the keyboard while a session may be logged,
+    /// nil otherwise. The app's fixtures never set it.
+    var typingLog: TypingLogger? {
+        get { engine.typingLog }
+        set { engine.typingLog = newValue }
+    }
+
+    /// A typing log session began: write the layout, shift, and suggestions as they are now.
+    func typingLogSessionBegan() {
+        guard let log = engine.typingLog else { return }
+        log.viewGeometry(size: bounds.size, safeArea: safeAreaInsets)
+        engine.logState("session")
+        log.commitGeometry()
+        log.suggestionsChanged(engine.suggestions)
+    }
+
+    @objc private func globeTapped() {
+        typingLog?.ui("globe")
+    }
 
     // MARK: - Size
 
@@ -123,6 +170,32 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
 
     var enableInputClicksWhenVisible: Bool { true }
 
+    func warmUpTextCheckerAsync() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let checker = self.engine.autocorrect.checker as? SystemTextChecker else { return }
+            checker.warmUp()
+            self.engine.refreshSuggestions()
+        }
+    }
+
+    func loadLexicon(_ lexicon: UILexicon) {
+        engine.autocorrect.loadLexicon(lexicon)
+        engine.refreshSuggestions()
+    }
+
+    func syncSettings() {
+        let journal = TypingJournal.sharedIfEnabled()
+        if engine.journal !== journal {
+            engine.journal = journal
+        }
+        engine.showsKeyPopups = FullKeyboardSettings().keyPopups
+        let wantsAutocorrect = FullKeyboardSettings().autocorrect
+        if engine.autocorrect.isEnabled != wantsAutocorrect {
+            engine.autocorrect.isEnabled = wantsAutocorrect
+            engine.refreshSuggestions()
+        }
+    }
+
     /// The field or its contents changed outside these keys.
     func textDidChange() {
         applyAppearance()
@@ -136,27 +209,44 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
             engine.textDidChange()
         }
         refreshReturnKey()
+        refreshStrip()
     }
 
     /// The keyboard came on screen for a (possibly new) field.
     func prepareForField() {
+        syncSettings()
         plane.cancelAllTouches()
         engine.configureForField()
         refreshReturnKey()
         applyAppearance()
+        refreshStrip()
         dismissStyleMenu()
+        if allowsHaptics() {
+            haptics.prepare()
+            selectionHaptics.prepare()
+        }
+    }
+
+    /// Frees non-essential UI and Metal drawables when the extension approaches its memory ceiling.
+    func handleMemoryWarning() {
+        dismissStyleMenu()
+        if !showsRecording, let panel = recordingPanel {
+            panel.tearDown()
+            panel.removeFromSuperview()
+            recordingPanel = nil
+        }
     }
 
     /// Hex inserted a dictation; offer to take it back until the next edit.
     func didInsertDictation(_ text: String) {
         lastDictation = text
-        undoChip.isHidden = false
         refreshStrip()
         undoHideWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.hideUndo() }
         undoHideWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: work)
         engine.textDidChange()
+        refreshReturnKey()
     }
 
     /// Fixtures: show a key held down.
@@ -165,29 +255,40 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
         engine.touchBegan(id: -1, at: CGPoint(x: key.frame.midX, y: key.frame.midY))
     }
 
+    /// Fixtures: show a key's long-press accent callout.
+    func debugHoldAccent(_ character: String, selectIndex: Int? = nil) {
+        guard let key = engine.layout.key(.character(character)) else { return }
+        let center = CGPoint(x: key.frame.midX, y: key.frame.midY)
+        engine.touchBegan(id: -2, at: center)
+        _ = engine.openAccentMenuIfEligible(forTouch: -2)
+        if let selectIndex,
+           let menu = engine.activeAccentMenu,
+           selectIndex >= 0, selectIndex < menu.cellFrames.count {
+            let cell = menu.cellFrames[selectIndex]
+            engine.touchMoved(id: -2, to: CGPoint(x: cell.midX, y: center.y))
+        }
+    }
+
     // MARK: - Layout
 
     override func layoutSubviews() {
         super.layoutSubviews()
         let isLandscape = orientation == .landscape
+        engine.typingLog?.viewGeometry(size: bounds.size, safeArea: safeAreaInsets)
         engine.orientation = orientation
         engine.horizontalInset = isLandscape ? max(safeAreaInsets.left, safeAreaInsets.right) : 0
         engine.width = bounds.width
+        engine.typingLog?.commitGeometry()
         let layout = engine.layout
 
         plane.frame = bounds
         callout.frame = bounds
-        strip.frame = layout.stripFrame
-        stripLabel.frame = strip.bounds.insetBy(dx: 16, dy: 0)
-        let chipSize = undoChip.sizeThatFits(CGSize(width: strip.bounds.width, height: 34))
-        undoChip.frame = CGRect(
-            x: (strip.bounds.width - chipSize.width) / 2,
-            y: (strip.bounds.height - 34) / 2,
-            width: chipSize.width,
-            height: 34
-        )
+        accentCallout.frame = bounds
+        stripView.frame = layout.stripFrame
 
+        hexKey.cornerRadius = layout.metrics.cornerRadius
         if let hex = layout.key(.hex) {
+            hexKey.inStrip = hex.row < 0
             hexKey.frame = hex.hitFrame
             hexKey.keycapFrame = hex.frame.offsetBy(dx: -hex.hitFrame.minX, dy: -hex.hitFrame.minY)
         }
@@ -200,6 +301,7 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
 
         if let panel = recordingPanel {
             panel.frame = bounds
+            panel.horizontalInset = layout.horizontalInset
             panel.metrics = layout.metrics
             panel.sideKeyWidth = layout.letterWidth * KeyboardLayout.modifierWidthRatio
         }
@@ -218,20 +320,18 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
             ?? FullKeyboardPalette.isDark(appearance: engine.target.keyboardAppearance, traits: traitCollection)
         let next = FullKeyboardPalette(isDark: isDark)
         backgroundColor = drawsBackdrop ? next.backdrop : .clear
+        stripView.inSystemPlatter = !drawsBackdrop
         guard next != palette || !didApplyPalette else { return }
         didApplyPalette = true
         palette = next
+        stripView.palette = next
         plane.palette = next
         callout.palette = next
         callout.setNeedsDisplay()
+        accentCallout.palette = next
         hexKey.palette = next
         recordingPanel?.palette = next
         styleMenu?.palette = next
-        stripLabel.textColor = next.textMuted
-        var chip = undoChip.configuration
-        chip?.baseForegroundColor = next.textMuted
-        chip?.background.backgroundColor = next.chipFill
-        undoChip.configuration = chip
     }
 
     private func refreshReturnKey() {
@@ -244,14 +344,23 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
         case .route: "route"
         case .send: "send"
         case .done: "done"
-        case .emergencyCall: "Emergency"
+        case .emergencyCall: "SOS"
         case .continue: "continue"
         default: "return"
         }
+        plane.returnSymbol = switch type {
+        case .send: "arrow.up"
+        case .go, .continue, .route, .join: "arrow.right"
+        case .google, .yahoo, .search: "magnifyingglass"
+        case .done: "checkmark"
+        case .emergencyCall: nil
+        default: "return"
+        }
         plane.returnIsAction = switch type {
-        case .go, .google, .yahoo, .search, .join, .route, .send, .done, .continue: true
+        case .go, .google, .yahoo, .search, .join, .route, .send, .done, .continue, .emergencyCall: true
         default: false
         }
+        plane.returnIsEnabled = !(engine.target.enablesReturnKeyAutomatically == true && !engine.target.hasText)
     }
 
     private func refreshFromModel() {
@@ -268,20 +377,41 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
         if let menu = styleMenu {
             menu.style = model.style
             menu.returnAppID = model.returnAppID
+            menu.quickReturnApps = model.quickReturnApps
         }
         refreshStrip()
     }
 
     private func refreshStrip() {
-        if !undoChip.isHidden {
-            stripLabel.text = nil
-        } else if !model.hasFullAccess {
-            stripLabel.text = "Allow Full Access to dictate with Hex"
-        } else if model.stagePhase == .failed, let message = model.statusMessage {
-            stripLabel.text = message
+        let status: String? = if !model.hasFullAccess {
+            "Allow Full Access to dictate with Hex"
+        } else if model.stagePhase == .failed {
+            model.statusMessage
         } else {
-            stripLabel.text = nil
+            nil
         }
+        stripView.update(
+            suggestions: engine.suggestions,
+            showsUndo: lastDictation != nil,
+            statusText: status,
+            clipboard: clipboard.offer(
+                textContentType: engine.target.textContentType,
+                hasFullAccess: model.hasFullAccess
+            )
+        )
+    }
+
+    private func pasteFromClipboard() {
+        let pasteboard = UIPasteboard.general
+        guard let text = pasteboard.string ?? pasteboard.url?.absoluteString, !text.isEmpty else { return }
+        keyFeedback()
+        clipboard.markPasted()
+        typingLog?.edit("paste", [TypingLogField("inserted", .string(text))])
+        engine.target.insertText(text)
+        engine.textDidChange()
+        typingLog?.context("paste")
+        refreshStrip()
+        onTextEdit?()
     }
 
     private func refreshRecordingPanel() {
@@ -304,17 +434,97 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
             panel.frame = bounds
             refreshRecordingPanel()
             panel.isHidden = false
-            fade(in: [panel], out: [strip, plane, hexKey, globeButton, callout])
+            if let (mark, bar) = morphFrames(), window != nil {
+                // The mark grows into a capsule and runs across the strip, then the panel takes over.
+                runMorph(from: mark, to: bar, appearing: true)
+                fade(in: [], out: [stripView, plane, hexKey, globeButton, callout, accentCallout])
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { [weak self, weak panel] in
+                    guard let self, self.showsRecording, let panel else { return }
+                    self.fade(in: [panel], out: [self.morph])
+                }
+            } else {
+                fade(in: [panel], out: [stripView, plane, hexKey, globeButton, callout, accentCallout])
+            }
         } else if let panel = recordingPanel {
             panel.scope.phase = .hidden
-            fade(in: [strip, plane, hexKey, globeButton, callout], out: [panel])
+            if let (mark, bar) = morphFrames(), window != nil {
+                runMorph(from: bar, to: mark, appearing: false)
+            }
+            fade(in: [stripView, plane, hexKey, globeButton, callout], out: [panel]) { [weak self, weak panel] in
+                guard let self, !self.showsRecording, let panel, panel === self.recordingPanel else { return }
+                panel.tearDown()
+                panel.removeFromSuperview()
+                self.recordingPanel = nil
+            }
         }
     }
 
-    private func fade(in shown: [UIView], out hidden: [UIView]) {
+    /// The Hex mark's frame in the strip and the full-width bar it grows into, or nil when
+    /// the Hex key sits in the bottom row.
+    private func morphFrames() -> (CGRect, CGRect)? {
+        let layout = engine.layout
+        guard let hex = layout.key(.hex), hex.row < 0 else { return nil }
+        let m = layout.metrics
+        let bar = CGRect(
+            x: layout.horizontalInset + m.side,
+            y: hex.frame.minY,
+            width: bounds.width - 2 * (layout.horizontalInset + m.side),
+            height: hex.frame.height
+        )
+        return (hex.frame, bar)
+    }
+
+    private func runMorph(from start: CGRect, to end: CGRect, appearing: Bool) {
+        morph.layer.removeAllAnimations()
+        // Under the recording panel on the way in (the panel fades in over it), above it on the
+        // way out so the bar is seen shrinking back into the mark.
+        if appearing {
+            insertSubview(morph, aboveSubview: stripView)
+        } else {
+            bringSubviewToFront(morph)
+        }
+        morph.backgroundColor = palette.chipFill
+        morph.frame = start
+        morph.layer.cornerRadius = start.height / 2
+        morph.alpha = appearing ? 0.6 : 1
+        morph.isHidden = false
+        UIView.animate(
+            withDuration: 0.34,
+            delay: 0,
+            usingSpringWithDamping: 0.82,
+            initialSpringVelocity: 0,
+            options: [.beginFromCurrentState, .allowUserInteraction]
+        ) {
+            self.morph.frame = end
+            self.morph.layer.cornerRadius = end.height / 2
+            if appearing { self.morph.alpha = 1 }
+        }
+        guard !appearing else { return }
+        UIView.animate(withDuration: 0.12, delay: 0.24, options: [.allowUserInteraction]) {
+            self.morph.alpha = 0
+        } completion: { _ in
+            if !self.showsRecording {
+                self.morph.isHidden = true
+            }
+        }
+    }
+
+    private func fade(in shown: [UIView], out hidden: [UIView], after: (() -> Void)? = nil) {
         shown.forEach { $0.isHidden = false }
         let globeHidden = engine.layout.key(.globe) == nil
+        let accentHidden = engine.activeAccentMenu == nil
         let duration = window == nil ? 0 : 0.18
+        if duration == 0 {
+            shown.forEach { $0.alpha = 1 }
+            hidden.forEach {
+                $0.alpha = 0
+                $0.isHidden = true
+            }
+            if globeHidden { globeButton.isHidden = true }
+            if accentHidden { accentCallout.isHidden = true }
+            after?()
+            return
+        }
         UIView.animate(withDuration: duration, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) {
             shown.forEach { $0.alpha = 1 }
             hidden.forEach { $0.alpha = 0 }
@@ -323,16 +533,28 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
                 view.isHidden = true
             }
             if globeHidden { self.globeButton.isHidden = true }
+            if accentHidden { self.accentCallout.isHidden = true }
+            after?()
         }
     }
 
     private func makeRecordingPanel() -> HexKeyRecordingPanel {
         let panel = HexKeyRecordingPanel(loudness: { [weak model] in model?.liveLoudnessDB ?? -62 })
         panel.alpha = 0
-        panel.onDone = { [weak self] in self?.model.onStopTap?() }
-        panel.onCancel = { [weak self] in self?.model.onCancelTap?() }
+        panel.onDone = { [weak self] in
+            self?.typingLog?.ui("dictation_stop")
+            self?.model.onStopTap?()
+        }
+        panel.onCancel = { [weak self] in
+            self?.typingLog?.ui("dictation_cancel")
+            self?.model.onCancelTap?()
+        }
         panel.onCycleStyle = { [weak self] in
             guard let self else { return }
+            self.typingLog?.ui("style", [
+                TypingLogField("style", .string(self.model.style.next.rawValue)),
+                TypingLogField("from", .string("recording_panel")),
+            ])
             self.model.onStyleSelected?(self.model.style.next)
         }
         insertSubview(panel, belowSubview: callout)
@@ -344,14 +566,21 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
     private func engineChanged() {
         plane.setNeedsDisplay()
         updateCallout()
+        refreshStrip()
         if globeButton.isHidden != (engine.layout.key(.globe) == nil) || hexKey.frame != engine.layout.key(.hex)?.hitFrame {
             setNeedsLayout()
         }
     }
 
     private func updateCallout() {
+        if let menu = engine.activeAccentMenu {
+            callout.show(nil, label: "")
+            accentCallout.show(menu)
+            return
+        }
+        accentCallout.show(nil)
         let layout = engine.layout
-        if let key = engine.previewKey, let balloon = layout.balloon(for: key) {
+        if engine.showsKeyPopups, let key = engine.previewKey, let balloon = layout.balloon(for: key) {
             callout.show(balloon, label: engine.displayLabel(for: key))
         } else {
             callout.show(nil, label: "")
@@ -363,17 +592,30 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
     private func keyFeedback() {
         UIDevice.current.playInputClick()
         if allowsHaptics() {
-            haptics.impactOccurred(intensity: 0.6)
+            haptics.impactOccurred(intensity: 0.65)
+            haptics.prepare()
         }
     }
 
-    /// A still hold on the Hex key; a tap does nothing, so a stray one while typing is harmless.
+    private func selectionFeedback() {
+        if allowsHaptics() {
+            selectionHaptics.selectionChanged()
+            selectionHaptics.prepare()
+        }
+    }
+
+    /// A tap or still hold on the Hex key.
     private func hexKeyHeld() {
         if allowsHaptics() { haptics.impactOccurred() }
         dismissStyleMenu()
         if hexKey.isWarm {
+            typingLog?.ui("hex_key", [TypingLogField("dictation", .string("warm"))])
             model.onDictateTap?()
+        } else if let local = model.onLocalDictateTap {
+            typingLog?.ui("hex_key", [TypingLogField("dictation", .string("keyboard"))])
+            local()
         } else {
+            typingLog?.ui("hex_key", [TypingLogField("dictation", .string("open_hex"))])
             model.onOpenURL?(model.coldStartURL)
         }
     }
@@ -383,24 +625,35 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
         guard let menu = styleMenu else { return }
         let local = hexKey.convert(point, to: menu)
         if release {
-            menu.pick(at: local)
+            menu.finishDrag(at: local)
         } else {
-            menu.highlight(at: local)
+            menu.updateDrag(at: local)
         }
     }
 
     private func showStyleMenu() {
         guard styleMenu == nil, !showsRecording else { return }
+        if allowsHaptics() {
+            haptics.impactOccurred()
+            haptics.prepare()
+        }
         plane.cancelAllTouches()
         let menu = HexStyleMenuView()
         menu.palette = palette
         menu.style = model.style
         menu.returnAppID = model.returnAppID
+        menu.quickReturnApps = model.quickReturnApps
+        menu.onHoverChanged = { [weak self] in self?.selectionFeedback() }
         menu.onStyle = { [weak self] style in
+            self?.typingLog?.ui("style", [
+                TypingLogField("style", .string(style.rawValue)),
+                TypingLogField("from", .string("hex_menu")),
+            ])
             self?.model.onStyleSelected?(style)
             self?.dismissStyleMenu()
         }
         menu.onReturnApp = { [weak self] appID in
+            self?.typingLog?.ui("return_app", [TypingLogField("app", .text(appID))])
             self?.model.onReturnAppSelected?(appID)
             self?.dismissStyleMenu()
         }
@@ -421,25 +674,33 @@ final class FullKeyboardView: UIView, UIInputViewAudioFeedback {
         showStyleMenu()
     }
 
-    @objc private func undoDictation() {
+    private func undoDictation() {
         guard let text = lastDictation else { return }
         let before = engine.target.documentContextBeforeInput ?? ""
         // Only take back text that is still right before the cursor.
         if before.hasSuffix(text) || (!before.isEmpty && before.count < text.count && text.hasSuffix(before)) {
+            // The host may show only the end of it; replay removes what the keys remove.
+            typingLog?.edit("undo_dictation", before.hasSuffix(text)
+                ? [TypingLogField("deleted", .string(text))]
+                : [TypingLogField("deletedCount", .int(text.count))])
             for _ in 0..<text.count {
                 engine.target.deleteBackward()
             }
+            onUndoDictation?()
+        } else {
+            typingLog?.ui("undo_dictation", [TypingLogField("applied", .bool(false))])
         }
         hideUndo()
         engine.textDidChange()
+        typingLog?.context("undo_dictation")
+        refreshReturnKey()
     }
 
     private func hideUndo() {
         undoHideWork?.cancel()
         undoHideWork = nil
-        lastDictation = nil
-        if !undoChip.isHidden {
-            undoChip.isHidden = true
+        if lastDictation != nil {
+            lastDictation = nil
             refreshStrip()
         }
     }

@@ -256,7 +256,8 @@ hex app
   polling the keyboard with the listener's hook suspended, because modifier-only chords never reach the window as key events.
 - Models are prepared in-process through `transcription/preparation`; the
   runtime saves the selection when it is ready and restarts the listener.
-- Enable on launch waits until first-run setup has recorded completion.
+- Enable on launch waits until first-run setup is ready (so the tour's
+  practice can dictate), or the tour finished without a model.
 - The dictation HUD is a Rune overlay (`rune_hud.rs`, shared with Linux): a
   HUD thread steps the shared indicator model and Dot scope, and the
   overlay's compositor draws each frame on the GPU with `rune_hud.wgsl`; Rune shows it in a topmost tool window
@@ -357,9 +358,11 @@ Linux under the native title bar. Mode processing, OpenCode rewriting, and trans
 through the same `dictation/processor` and `personal_commands` modules as
 macOS, and Windows reaches the running OpenCode service the same way: its
 registration file and loopback HTTP, never a CLI. Like macOS,
-an unset OpenCode model tries the ranked recommended models before the
-OpenCode default. An OpenCode service running inside WSL2 is found only with
-Labs › OpenCode in WSL on: WSL2 forwards its loopback URL, and the lab adds
+an unset OpenCode model in a mode tries the ranked recommended models before
+the OpenCode default, while meeting notes with no chosen model ask only
+OpenCode's own default model. An OpenCode service running inside WSL2 is
+found only with Labs › OpenCode in WSL on: WSL2 forwards its loopback URL, and
+the lab adds
 the default distribution's registration and a Linux workspace path for
 `x-opencode-directory`. Annotate's capture sends use the same service: the
 prompt's "Recorded at" line names the capture folder as a Linux `/mnt/…` path

@@ -550,6 +550,27 @@ fn chapters_extend_every_title_but_one_the_user_typed() {
 }
 
 #[test]
+fn an_old_twelve_hour_default_title_stays_the_default_in_another_language() {
+    let (base, directory) = finished_meeting("old-default-title", "Meeting");
+    let mut manifest = read_manifest(&directory).unwrap();
+    let started = transcript::LocalTime::from_ms(manifest.created_at_ms);
+    manifest.title = format!("Meeting — {}", started.twelve_hour_clock());
+    assert!(
+        manifest.title.ends_with(" AM") || manifest.title.ends_with(" PM"),
+        "{}",
+        manifest.title
+    );
+    assert_eq!(manifest.title_source, None);
+
+    crate::desktop::i18n::apply(Some("de"));
+    assert_ne!(manifest.title, default_title(None, manifest.created_at_ms));
+    assert_eq!(manifest.title_source(), TitleSource::Default);
+    crate::desktop::i18n::apply(Some("en"));
+    assert_eq!(manifest.title, default_title(None, manifest.created_at_ms));
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn deleting_trashes_the_markdown_then_the_recording_and_refuses_while_recording() {
     let (base, directory) = finished_meeting("trash", "Design sync");
     let export = read_manifest(&directory).unwrap().export_path.unwrap();
@@ -624,6 +645,18 @@ fn the_exported_markdown_is_the_reveal_target_only_while_it_exists() {
         RevealTarget::Folder(directory.clone())
     );
     fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn explorer_opens_a_folder_itself_without_the_select_switch() {
+    assert_eq!(
+        explorer_open(Path::new(r"C:\Users\dax\Documents\Hex Meetings")).as_os_str(),
+        std::ffi::OsStr::new(r#""C:\Users\dax\Documents\Hex Meetings""#)
+    );
+    assert_eq!(
+        explorer_open(Path::new(r"D:\Notes,2026")).as_os_str(),
+        std::ffi::OsStr::new(r#""D:\Notes,2026""#)
+    );
 }
 
 #[test]
@@ -954,6 +987,30 @@ fn retention_expires_meetings_by_when_they_ended_and_skips_active_ones() {
     let pending = vec!["pending".to_string()];
 
     let chosen = Some(MeetingRetention::Day);
+    let readable = meetings
+        .iter()
+        .filter(|meeting| {
+            retention::readable(
+                meeting,
+                meeting.status,
+                pending.contains(&meeting.id),
+                chosen,
+                now,
+            )
+        })
+        .map(|meeting| meeting.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        readable,
+        [
+            "long-call",
+            "recent-start",
+            "recording",
+            "transcribing",
+            "pending",
+            "edge"
+        ]
+    );
     assert_eq!(
         expired_meetings(&meetings, chosen, &pending, now),
         ["old", "no-end"]
@@ -1114,14 +1171,20 @@ fn paste_cursor_counts_coalesced_turns_and_advances_only_on_success() {
         entry(MeetingSource::System, 2_500, 3_500, "Got it."),
     ];
     let mut cursor = MeetingPasteCursor::default();
-    assert_eq!(cursor.pending_turn_count("meeting-a", &initial), 2);
+    assert_eq!(
+        cursor.pending("meeting-a", &initial),
+        PendingDelta {
+            turns: 2,
+            span_ms: 3_500
+        }
+    );
 
     // A failed paste or clipboard write must not advance the cursor.
     let failed = cursor.consume_entries("meeting-a", &initial, |_| {
         Err(eyre!("clipboard unavailable"))
     });
     assert!(failed.is_err());
-    assert_eq!(cursor.pending_turn_count("meeting-a", &initial), 2);
+    assert_eq!(cursor.pending("meeting-a", &initial).turns, 2);
 
     // A successful copy/paste commits the entries and drops the count to 0.
     let mut copied = String::new();
@@ -1133,7 +1196,10 @@ fn paste_cursor_counts_coalesced_turns_and_advances_only_on_success() {
         .unwrap();
     assert_eq!(text, "You: First. Still me.\n\nThem: Got it.");
     assert_eq!(copied, text);
-    assert_eq!(cursor.pending_turn_count("meeting-a", &initial), 0);
+    assert_eq!(
+        cursor.pending("meeting-a", &initial),
+        PendingDelta::default()
+    );
     assert!(
         cursor
             .consume_entries("meeting-a", &initial, |_| Ok(()))
@@ -1148,15 +1214,22 @@ fn paste_cursor_counts_coalesced_turns_and_advances_only_on_success() {
         7_000,
         "Next point.",
     ));
-    assert_eq!(cursor.pending_turn_count("meeting-a", &extended), 1);
+    // Its span is at least a second, so a short turn still reads "1 sec new".
+    assert_eq!(
+        cursor.pending("meeting-a", &extended),
+        PendingDelta {
+            turns: 1,
+            span_ms: 1_000
+        }
+    );
     let delta = cursor
         .consume_entries("meeting-a", &extended, |_| Ok(()))
         .unwrap();
     assert_eq!(delta, "You: Next point.");
-    assert_eq!(cursor.pending_turn_count("meeting-a", &extended), 0);
+    assert_eq!(cursor.pending("meeting-a", &extended).turns, 0);
 
     // Switching to a new meeting starts from the beginning.
-    assert_eq!(cursor.pending_turn_count("meeting-b", &initial), 2);
+    assert_eq!(cursor.pending("meeting-b", &initial).turns, 2);
 }
 
 #[test]
