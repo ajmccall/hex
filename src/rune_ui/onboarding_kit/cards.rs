@@ -52,6 +52,9 @@ pub(crate) struct Notice {
     pub(crate) key: &'static str,
     pub(crate) app: App,
     pub(crate) from: &'static str,
+    /// The person it's from, whose photo, if they have one, stands in for
+    /// the app's icon.
+    pub(crate) person: Option<&'static str>,
     pub(crate) place: Option<&'static str>,
     pub(crate) body: &'static str,
     pub(crate) field: &'static str,
@@ -61,6 +64,7 @@ pub(crate) const FRANK: Notice = Notice {
     key: "frank",
     app: App::Messages,
     from: "Frank",
+    person: None,
     place: None,
     body: "your phone is on silent right",
     field: "iMessage",
@@ -69,6 +73,7 @@ pub(crate) const JAY: Notice = Notice {
     key: "jay",
     app: App::Messages,
     from: "Jay · CEO",
+    person: Some("Jay"),
     place: None,
     body: "The investors are in the room. Are we ready to ship?",
     field: "iMessage",
@@ -77,6 +82,7 @@ pub(crate) const DAX: Notice = Notice {
     key: "dax",
     app: App::Slack,
     from: "Dax",
+    person: None,
     place: Some("#opencode"),
     body: "can you look at the effect PR before 5",
     field: "Reply in thread",
@@ -85,6 +91,7 @@ pub(crate) const ADAM: Notice = Notice {
     key: "adam",
     app: App::Slack,
     from: "Adam",
+    person: None,
     place: Some("#hex"),
     body: "hex just typed my standup into figma",
     field: "Reply in thread",
@@ -196,7 +203,7 @@ pub(crate) fn notice(p: Paint, n: &Notice, reply: Reply<'_>, example: bool) -> E
                 .key("top")
                 .gap(10.0)
                 .items_start()
-                .child(app_icon(p, n.app))
+                .child(sender_icon(p, n))
                 .child(message),
         );
 
@@ -427,18 +434,14 @@ pub(crate) struct Sender<'a> {
 const FACE: f32 = 24.0;
 const FACE_GAP: f32 = 7.0;
 
-/// The sender's face beside a line in a group, or the room it would take.
+/// The sender's face beside a line in a group, or the room it would take. The
+/// face stays mounted at zero opacity on the older lines, so a newer line
+/// fades it out there as it fades in on itself instead of the photo popping
+/// off in one frame.
 fn face_slot(p: Paint, sender: Sender<'_>) -> El {
-    match sender {
-        sender if sender.last => {
-            super::inbox::face(p, sender.name, sender.colour, FACE).key("face")
-        }
-        _ => el()
-            .key("face")
-            .size(FACE, FACE)
-            .radius(FACE * 0.5)
-            .border(p.hair, Color::TRANSPARENT),
-    }
+    super::inbox::face(p, sender.name, sender.colour, FACE)
+        .key("face")
+        .opacity(if sender.last { 1.0 } else { 0.0 })
 }
 
 /// One message in [`chat`]'s thread: theirs on the left, yours on the right
@@ -983,6 +986,13 @@ pub(crate) fn field_text_origin(card_bottom_left: [f32; 2], lines: usize) -> [f3
         x + CARD_PAD + FIELD_PX,
         bottom - CARD_PAD - FIELD_PY - lines as f32 * FIELD_LINE,
     ]
+}
+
+/// The sender's photo in a circle, or else the app's icon.
+fn sender_icon(p: Paint, n: &Notice) -> El {
+    n.person
+        .and_then(|person| super::inbox::photo_face(p, person, ICON))
+        .map_or_else(|| app_icon(p, n.app), |photo| photo.key("icon"))
 }
 
 fn app_icon(p: Paint, app: App) -> El {

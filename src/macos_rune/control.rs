@@ -320,9 +320,10 @@ impl Pump {
     /// an open window adopt it.
     fn edit_vocabulary(&mut self, command: &ControlCommand) -> Result<ControlReply, ControlError> {
         let mut settings = load()?;
+        let base = settings.clone();
         let reply = control::edit_vocabulary(&mut settings.vocabulary, command)?;
         if matches!(reply, ControlReply::Done { changed: true, .. }) {
-            settings.save().map_err(|error| {
+            base.update(&settings).map_err(|error| {
                 ControlError::new("internal", format!("couldn't save: {error:#}"))
             })?;
             let _ = self.runtime.send(Request::ReloadSettings);
@@ -396,6 +397,9 @@ impl Pump {
                         "Recording “{title}”; `hex meetings stop` stops and transcribes it"
                     ))
                 }
+                (Some(ControllerEvent::Stopping), true) => {
+                    ControlReply::done("Stopping the meeting recording")
+                }
                 (Some(ControllerEvent::Transcribing | ControllerEvent::Finished(_)), true) => {
                     ControlReply::done("Stopped recording; transcribing the meeting")
                 }
@@ -446,23 +450,15 @@ impl Pump {
         if !change.changed(before) {
             return Ok(ControlReply::unchanged(unchanged()));
         }
-        change
-            .settings
-            .save()
+        before
+            .update(&change.settings)
             .map_err(|error| ControlError::new("internal", format!("couldn't save: {error:#}")))?;
         let _ = self.runtime.send(Request::ReloadSettings);
         for effect in change.effects {
             match effect {
-                settings::Effect::HistoryRetention(retention) => {
-                    if let Some(history) = self.runtime.history()
-                        && let Err(error) = history.set_retention(retention)
-                    {
-                        tracing::warn!(%error, "could not apply history retention");
-                    }
-                }
                 // An open window keeps the Dock icon; closing it applies this.
                 settings::Effect::DockIcon if !window_visible() => {
-                    crate::app_settings::set_dock_icon_visible(
+                    crate::macos_rune::set_dock_icon_visible(
                         crate::app_settings::dock_icon_visible(
                             change.settings.show_dock_icon,
                             crate::macos_rune::status_item::installed(),
@@ -563,19 +559,30 @@ fn listener_command(
             raw,
         } => background(reply, move || {
             let action = control::check_flags(action, true, raw)?;
+            let printing_start = action == control::CaptureAction::Start;
+            if printing_start && !crate::labs::print_start() {
+                return Err(control::ControlError::new(
+                    "disabled",
+                    "Labs › Dictation for a command is off; turn it on with \
+                     `hex labs on print-start`",
+                ));
+            }
             listener_ready(&runtime)?;
             let (print, printed) = control::PrintReply::channel();
-            // The listener answers once the recording stopped; only this
-            // command then waits for the transcript.
+            // A printing start answers only when its dictation ends; a
+            // printing stop answers once the recording stopped.
+            let wait = if printing_start {
+                control::PRINT_START_WAIT
+            } else {
+                control::PRINT_WAIT
+            };
             match ask(&runtime, |reply| RecognitionControl::Capture {
                 action,
                 print: Some(print),
-                raw: false,
+                raw: printing_start && raw,
                 reply,
             })? {
-                ControlReply::Done { .. } => {
-                    Ok(control::await_printed(&printed, control::PRINT_WAIT))
-                }
+                ControlReply::Done { .. } => Ok(control::await_printed(&printed, wait)),
                 refused => Ok(refused),
             }
         }),
@@ -700,12 +707,16 @@ fn clear_history(runtime: &RuntimeHandle) -> Result<ControlReply, ControlError> 
         .history()
         .ok_or_else(|| ControlError::new("unavailable", "history couldn't be opened"))?;
     let count = history.search("").len();
-    if count == 0 {
+    let rollup = history.has_usage();
+    if count == 0 && !rollup {
         return Ok(ControlReply::unchanged("History is already empty"));
     }
     history
         .clear()
         .map_err(|error| ControlError::new("failed", format!("couldn't clear history: {error}")))?;
+    if count == 0 {
+        return Ok(ControlReply::done("Cleared history stats"));
+    }
     Ok(ControlReply::done(format!(
         "Cleared {count} dictation{}",
         if count == 1 { "" } else { "s" }
@@ -910,9 +921,7 @@ fn status(
     };
     let open = window.is_visible();
     let settings = &published.settings;
-    let selection = &settings.transcription;
-    let definition = crate::transcription::models::definition(selection.model);
-    let setup = crate::desktop::onboarding::status(selection);
+    let setup = crate::desktop::onboarding::status(&settings.transcription);
     Ok(ControlReply::Status(Box::new(StatusReport {
         app_version: crate::VERSION.into(),
         pid: std::process::id(),
@@ -922,23 +931,20 @@ fn status(
             status: if microphone_unavailable {
                 "No microphone".into()
             } else {
-                published.listener.status.clone()
+                published.listener.status.to_string()
             },
             shortcuts: Vec::new(),
         },
         capture,
         meeting,
         model: ModelReport {
-            id: selection.model.as_str().into(),
-            name: definition.name.into(),
-            language: selection.language.clone(),
-            installed: crate::transcription::models::is_installed(definition, &selection.language),
             preparing: published
                 .preparation
                 .model
                 .map(|model| model.as_str().into()),
             downloaded_bytes: published.preparation.downloaded_bytes,
             error: published.preparation.error.clone(),
+            ..ModelReport::saved(&settings.transcription)
         },
         features: FeatureReport {
             meetings: crate::app_settings::meetings_enabled(),
@@ -966,7 +972,7 @@ fn status(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
@@ -980,7 +986,8 @@ mod tests {
             move |selection: &TranscriptionSelection,
                   installed_only: bool,
                   _: &AtomicBool,
-                  _: &AtomicU64| {
+                  _: &AtomicU64,
+                  _: &AtomicU8| {
                 let _ = sender.send((selection.clone(), installed_only));
                 Ok(())
             },
@@ -991,6 +998,7 @@ mod tests {
                 Default::default(),
                 None,
             ),
+            app_switcher: crate::transcription::app_model_switching::Switcher::new(false, None),
             automatic_preparation: false,
             preparation,
             recognition_start: None,

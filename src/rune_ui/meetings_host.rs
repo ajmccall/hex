@@ -50,15 +50,19 @@ impl LocalMeetings {
                 .map_err(failed),
             MeetingRequest::Trash(id) => crate::meeting::trash(&id).map_err(failed),
             MeetingRequest::Reveal(target) => {
-                // Explorer selects the exported Markdown; Linux opens the
-                // folder that holds it.
-                crate::meeting::reveal(target.path());
+                // A file is selected in its folder; a recording folder opens
+                // itself.
+                if target.is_markdown() {
+                    crate::meeting::reveal(target.path());
+                } else {
+                    crate::meeting::open_folder(target.path());
+                }
                 Ok(())
             }
             MeetingRequest::RevealFolder => {
                 let folder = crate::app_settings::meeting_output_folder();
                 std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
-                crate::meeting::reveal(&folder);
+                crate::meeting::open_folder(&folder);
                 Ok(())
             }
             MeetingRequest::ChooseFolder => {
@@ -219,22 +223,9 @@ fn turns(entries: &[crate::meeting::TranscriptEntry]) -> Vec<Turn> {
         .collect()
 }
 
-/// A capsule's "Never offer" or "Always record" choice, kept in the window's
-/// live settings so its next save doesn't drop it.
-pub(crate) fn meeting_provider_chosen(
-    ui: &mut Ui,
-    choice: crate::app_settings::MeetingProviderChoice,
-) {
-    crate::app_settings::set_meeting_provider(&mut ui.settings.meetings, choice);
-}
-
-/// The corner the recording capsule was dragged to, kept in the window's live
-/// settings so its next save doesn't move it back.
-pub(crate) fn meeting_corner_moved(
-    ui: &mut Ui,
-    corner: crate::app_settings::MeetingIndicatorCorner,
-) {
-    ui.settings.meetings.recording_indicator_corner = corner;
+/// The capsule committed a choice; adopt the owner's next revision.
+pub(crate) fn meeting_settings_saved(ui: &mut Ui) {
+    ui.send(super::host::Request::ReloadSettings);
 }
 
 /// A meeting recording could not start or finish; the Meetings pane says why.
@@ -318,6 +309,15 @@ mod tests {
             .map(|entry| serde_json::to_string(entry).unwrap() + "\n")
             .collect::<String>();
         std::fs::write(directory.join("transcript.ndjson"), ndjson).unwrap();
+        // A final publication includes both files, even though chapter
+        // queries render their own Markdown from the structured entries.
+        std::fs::write(
+            directory.join("transcript.md"),
+            "# Team sync\n\n**You** · 03:01\nNext, the motion lint.\n\n\
+             **You** · 06:26\nThat settles the lint.\n\n\
+             **You** · 06:30\nLast thing: a name for the chat app.\n",
+        )
+        .unwrap();
 
         let library = crate::meeting::query::Library::new(&root);
         let meeting = library.meeting(id).unwrap();

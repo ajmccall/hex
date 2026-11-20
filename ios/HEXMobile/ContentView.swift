@@ -40,6 +40,7 @@ struct ContentView: View {
     @Binding var openedFromKeyboard: Bool
     @Binding var showSetup: Bool
     @State private var setupMonitor = KeyboardSetupMonitor()
+    @State private var onboardingPage = OnboardingProgress.launchPage
     @State private var practiceText = ""
     @State private var showReturnAppsEditor = false
     @FocusState private var practiceFocused: Bool
@@ -70,6 +71,9 @@ struct ContentView: View {
             if openedFromKeyboard {
                 keyboardHandoffView
                     .transition(.opacity)
+            } else if onboardingPage != nil {
+                OnboardingView(dictation: dictation, monitor: setupMonitor, page: $onboardingPage)
+                    .transition(.opacity)
             } else {
                 standaloneView
                     .transition(.opacity)
@@ -77,6 +81,7 @@ struct ContentView: View {
         }
         .preferredColorScheme(.dark)
         .animation(HexMotion.reducedFade, value: openedFromKeyboard)
+        .animation(HexMotion.reducedFade, value: onboardingPage == nil)
     }
 
     private var appStageMode: AppStageMode {
@@ -502,11 +507,16 @@ struct ContentView: View {
 
             Toggle(
                 isOn: Binding(
-                    get: { dictation.allowBluetoothMic },
-                    set: { dictation.setAllowBluetoothMic($0) }
+                    get: { !dictation.allowBluetoothMic },
+                    set: { dictation.setAllowBluetoothMic(!$0) }
                 )
             ) {
-                rowTitle("Bluetooth microphone")
+                VStack(alignment: .leading, spacing: 2) {
+                    rowTitle("Always use iPhone microphone")
+                    Text("Keeps music playing and starts faster")
+                        .font(.system(size: 12))
+                        .foregroundStyle(HexTheme.textMuted)
+                }
             }
             .tint(HexTheme.success)
             .padding(.horizontal, 16)
@@ -523,6 +533,25 @@ struct ContentView: View {
                     rowTitle("Keyboard settings")
                     Spacer()
                     Image(systemName: "arrow.up.right")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(HexTheme.textMuted)
+                }
+                .padding(.horizontal, 16)
+                .frame(minHeight: 48)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            rowDivider
+
+            Button {
+                OnboardingProgress.save(.welcome)
+                onboardingPage = .welcome
+            } label: {
+                HStack(spacing: 8) {
+                    rowTitle("Run setup again")
+                    Spacer()
+                    Image(systemName: "chevron.right")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(HexTheme.textMuted)
                 }

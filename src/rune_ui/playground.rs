@@ -92,6 +92,18 @@ const PATHS: &[(&str, &str)] = &[
     ("shortcut-row-held", "Window/General/Shortcut/Held"),
     ("shortcut-row-rejected", "Window/General/Shortcut/Rejected"),
     ("shortcut-row-saved", "Window/General/Shortcut/Saved"),
+    (
+        "mac-settings-reset",
+        "Window/General/Shortcut/Paste last changed · Reset",
+    ),
+    (
+        "mac-settings-reset-off",
+        "Window/General/Shortcut/Paste last off · Reset",
+    ),
+    (
+        "mac-settings-recording-optional",
+        "Window/General/Shortcut/Recording Paste last · ⌫ turns off",
+    ),
     ("mac-update-checking", "Window/General/Updates/Checking"),
     (
         "mac-update-downloading",
@@ -150,6 +162,7 @@ const PATHS: &[(&str, &str)] = &[
     ("modes", "Window/Modes/Modes"),
     ("modes-global", "Window/Modes/Global mode"),
     ("modes-picker", "Window/Modes/App picker"),
+    ("modes-speech", "Window/Modes/Speech model"),
     (
         "modes-transformation-menu",
         "Window/Modes/Transformation menu",
@@ -192,7 +205,28 @@ const PATHS: &[(&str, &str)] = &[
     ("history-menu", "Window/History/Retention menu"),
     ("history-clear", "Window/History/Clear all asks first"),
     ("history-stats", "Window/History/Stats dialog"),
+    (
+        "history-selection",
+        "Window/History/Select multiple dictations",
+    ),
     ("history-empty", "Window/History/Empty"),
+    #[cfg(all(target_os = "macos", hex_capture))]
+    ("mac-history", "Window/History/History with captures"),
+    #[cfg(all(target_os = "macos", hex_capture))]
+    ("mac-history-capture", "Window/History/A capture's detail"),
+    #[cfg(all(target_os = "macos", hex_capture))]
+    ("mac-history-filtered", "Window/History/Only annotations"),
+    #[cfg(all(target_os = "macos", hex_capture))]
+    ("mac-history-types", "Window/History/Type menu"),
+    #[cfg(all(target_os = "macos", hex_capture))]
+    ("mac-history-search", "Window/History/Search with matches"),
+    #[cfg(all(target_os = "macos", hex_capture))]
+    (
+        "mac-history-search-empty",
+        "Window/History/Search with nothing",
+    ),
+    #[cfg(all(target_os = "macos", hex_capture))]
+    ("mac-history-empty", "Window/History/Nothing yet"),
     #[cfg(hex_capture)]
     ("captures", "Window/Captures/Captures"),
     #[cfg(hex_capture)]
@@ -227,6 +261,20 @@ const PATHS: &[(&str, &str)] = &[
     ("mac-labs-category", "Window/General/Labs category"),
     ("mac-labs-search", "Window/General/Labs search"),
     ("mac-labs-settings", "Window/General/Labs settings"),
+    ("mac-labs-yolo-mode", "Window/General/Labs YOLO mode"),
+    (
+        "mac-labs-yolo-mode-picker",
+        "Window/General/Labs YOLO mode picker",
+    ),
+    ("drop-hover", "Window/General/Labs dropped file hover"),
+    (
+        "drop-running",
+        "Window/General/Labs dropped file transcribing",
+    ),
+    (
+        "mac-labs-drop-transcribe",
+        "Window/General/Labs transcribe audio",
+    ),
     ("mac-production", "Window/General/Production build"),
     ("mac-activity", "Window/Activity/Activity"),
     ("mac-onboarding", "Window/Onboarding/Setting up Hex"),
@@ -257,6 +305,10 @@ const PATHS: &[(&str, &str)] = &[
         "Window/Onboarding/Your turn · reopen",
     ),
     ("mac-onboarding-ready", "Window/Onboarding/Hex is ready"),
+    (
+        "mac-onboarding-ready-tap",
+        "Window/Onboarding/Hex is ready · tap to start",
+    ),
     ("portal", "Linux & Windows/Settings · portal shortcuts"),
     ("commands", "Linux & Windows/Settings · hex commands"),
     ("portal-mouse", "Linux & Windows/Settings · mouse button"),

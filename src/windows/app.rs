@@ -24,10 +24,11 @@ use crate::desktop::activity::{DesktopActivity, last_completed_at};
 use crate::desktop::events::EventReader;
 use crate::desktop::host::{
     DesktopAction, DesktopListenerSnapshot, DesktopShortcuts, DesktopTranscriptionSnapshot,
+    ListenerStatus,
 };
 use crate::desktop::i18n::tr_fill;
 use crate::history::History;
-use crate::transcription::models::{ModelPreparationStage, TranscriptionModelId};
+use crate::transcription::models::TranscriptionModelId;
 use crate::transcription::preparation::TranscriptionPreparation;
 use crate::windows::rune::{Published, Request};
 
@@ -67,7 +68,7 @@ pub(crate) struct WindowsDesktopHost {
     listen_when_ready: bool,
     /// Enable on launch waits for first-run setup.
     listen_after_setup: bool,
-    status: String,
+    status: ListenerStatus,
     error: Option<String>,
     settings: AppSettings,
     history: Option<History>,
@@ -79,6 +80,8 @@ pub(crate) struct WindowsDesktopHost {
     personal_commands_checked_at: Instant,
     preparation: TranscriptionPreparation,
     keyboard_switcher: crate::transcription::keyboard_model_switching::Switcher,
+    /// Labs › Switch model with app: the foreground app's mode choice.
+    app_switcher: crate::transcription::app_model_switching::Switcher,
     /// Present only while keyboard model switching is on.
     input_sources: Option<crate::keyboard_input_sources::Watcher>,
     /// The preparation running is a keyboard switch, which a manual choice
@@ -162,6 +165,11 @@ impl AppInstance {
                 AllowSetForegroundWindow(ASFW_ANY);
                 SetEvent(event);
             }
+        } else {
+            // A hidden launch (`hex start`, `hex restart`, a login launch)
+            // only yields, so nothing else records that it came and went:
+            // say why here, or a lost relaunch leaves no trace at all.
+            tracing::info!("Hex is already running; this hidden launch exits");
         }
         // SAFETY: `event` is a valid handle owned by this function.
         unsafe { CloseHandle(event) };
@@ -200,6 +208,14 @@ impl WindowsDesktopHost {
         processing: crate::dictation::modes::ProcessingState,
     ) -> Self {
         crate::desktop::i18n::apply(settings.ui_language.as_deref());
+        // The Sounds sheet also plays with the listener stopped and volume Off.
+        // Preloading decodes the sounds without opening a device.
+        crate::feedback::set_enabled(settings.sound_effects);
+        crate::feedback::set_volume(settings.sound_effect_volume);
+        crate::feedback::set_sound_set(settings.sound_theme);
+        if let Err(error) = crate::feedback::preload() {
+            tracing::warn!(%error, "Windows recording feedback is unavailable");
+        }
         let mut event_reader = EventReader::open(&event_path);
         let mut activity = DesktopActivity::default();
         activity.refresh(&mut event_reader);
@@ -215,6 +231,16 @@ impl WindowsDesktopHost {
                 .then(crate::keyboard_input_sources::current)
                 .flatten(),
         );
+        // Known before the first poll, so launching keeps the saved model
+        // instead of applying the frontmost app's mode choice.
+        let app_switcher = crate::transcription::app_model_switching::Switcher::new(
+            settings.labs.app_model_switching,
+            settings
+                .labs
+                .app_model_switching
+                .then(|| crate::transcription::app_model_switching::startup_choice(&settings))
+                .flatten(),
+        );
         let mut host = Self {
             event_path,
             event_reader,
@@ -226,7 +252,7 @@ impl WindowsDesktopHost {
             awaiting_session_start: false,
             listen_when_ready: false,
             listen_after_setup: false,
-            status: "Disabled".into(),
+            status: ListenerStatus::Disabled,
             error: settings_error,
             settings,
             history,
@@ -238,6 +264,7 @@ impl WindowsDesktopHost {
             personal_commands_checked_at: Instant::now(),
             preparation: TranscriptionPreparation::default(),
             keyboard_switcher,
+            app_switcher,
             input_sources: None,
             automatic_preparation: false,
             updater: crate::updater::Updater::start(),
@@ -246,15 +273,27 @@ impl WindowsDesktopHost {
         };
         crate::transcription::models::delete_set_aside();
         host.refresh_personal_commands_host();
-        // The microphone stays cold until first-run setup finishes.
+        // The microphone stays cold until first-run setup is ready.
         if host.settings.enable_on_launch {
-            if crate::desktop::onboarding::completion_recorded() {
+            if host.setup_done() {
                 host.start();
             } else {
                 host.listen_after_setup = true;
             }
         }
         host
+    }
+
+    /// The host's retained-history store; one store per process.
+    pub(crate) fn history(&self) -> Option<History> {
+        self.history.clone()
+    }
+
+    /// Setup is ready, so the tour's practice can dictate, or the tour
+    /// finished without a model.
+    fn setup_done(&self) -> bool {
+        crate::desktop::onboarding::status(&self.settings.transcription).ready()
+            || crate::desktop::onboarding::completion_recorded()
     }
 
     /// Handles one window or tray request; returns `true` when Hex should quit.
@@ -287,15 +326,20 @@ impl WindowsDesktopHost {
                 }
             }
             Request::Quit => return true,
-            Request::ReloadSettings => match AppSettings::load() {
-                Ok(settings) => self.apply_settings(&settings),
-                Err(error) => tracing::warn!(%error, "could not reload settings"),
-            },
+            Request::ReloadSettings => self.reload_settings(),
             Request::CaptureShortcutFor(_)
             | Request::CancelShortcut
             | Request::SetShortcut { .. } => {}
         }
         false
+    }
+
+    fn reload_settings(&mut self) {
+        match self.settings.refreshed() {
+            Ok(Some(settings)) => self.apply_settings(&settings),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "could not reload settings"),
+        }
     }
 
     fn dispatch(&mut self, action: DesktopAction) -> bool {
@@ -342,6 +386,7 @@ impl WindowsDesktopHost {
                 .source_changed(source, Instant::now());
         }
         self.keyboard_switcher.manual_choice();
+        self.app_switcher.manual_choice();
         if self.automatic_preparation {
             self.preparation.cancel();
             self.automatic_preparation = false;
@@ -357,8 +402,8 @@ impl WindowsDesktopHost {
         }
     }
 
-    /// Follows the foreground layout while switching is on, and starts the
-    /// installed-only preparation of a mapping once it is due.
+    /// Follows the focused window's layout while switching is on, and starts
+    /// the installed-only preparation of a mapping once it is due.
     fn switch_with_keyboard(&mut self) {
         let enabled = self.settings.keyboard_model_switching.enabled;
         if enabled != self.input_sources.is_some() {
@@ -368,11 +413,17 @@ impl WindowsDesktopHost {
             .input_sources
             .as_mut()
             .and_then(|watcher| watcher.poll())
-            && self
+        {
+            tracing::info!(
+                source = source.as_deref().unwrap_or("none"),
+                "keyboard input source changed"
+            );
+            if self
                 .keyboard_switcher
                 .source_changed(source, Instant::now())
-        {
-            self.supersede_automatic();
+            {
+                self.supersede_automatic();
+            }
         }
         let Some(choice) = self.keyboard_switcher.take_due(Instant::now()) else {
             return;
@@ -394,9 +445,55 @@ impl WindowsDesktopHost {
         }
     }
 
+    /// Follows the foreground app while switching is on, and starts the
+    /// installed-only preparation of a mode's speech choice once it is due.
+    /// Hex's own window and a moment with no window in front name no mode,
+    /// so they leave the last match and any switch it scheduled alone. The
+    /// host cannot see a listener recording, so a due switch is held only
+    /// while the shared engine's dictation streams or finishes run.
+    fn switch_with_app(&mut self) {
+        if !self.settings.labs.app_model_switching {
+            return;
+        }
+        let application = foreground_other_process_stem();
+        let now = Instant::now();
+        if self.app_switcher.observe(
+            crate::transcription::app_model_switching::Observation::frontmost(
+                application.as_deref(),
+                None,
+            ),
+            |application, _| {
+                crate::transcription::app_model_switching::mode_choice(
+                    &self.settings,
+                    application,
+                    None,
+                )
+            },
+            now,
+        ) {
+            self.supersede_automatic();
+        }
+        if crate::transcription::engine::dictation_busy() {
+            return;
+        }
+        let Some(choice) = self
+            .app_switcher
+            .take_due(now, &self.settings.transcription)
+        else {
+            return;
+        };
+        let selection = crate::transcription::models::TranscriptionSelection {
+            language: choice.language,
+            ..self.settings.transcription_for_model(choice.model)
+        };
+        self.preparation.start(selection, true);
+        self.automatic_preparation = true;
+    }
+
     fn model_ready(&self) -> bool {
-        let model = crate::transcription::models::definition(self.settings.transcription.model);
-        crate::transcription::models::is_installed(model, &self.settings.transcription.language)
+        let selection = self.runtime_selection();
+        let model = crate::transcription::models::definition(selection.model);
+        crate::transcription::models::is_installed(model, &selection.language)
             && crate::transcription::models::is_verified(model)
     }
 
@@ -406,7 +503,7 @@ impl WindowsDesktopHost {
             return;
         }
         if !self.model_ready() {
-            self.status = "Model required".into();
+            self.status = ListenerStatus::ModelRequired;
             return;
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -455,11 +552,11 @@ impl WindowsDesktopHost {
                 });
                 self.session_before_start = self.activity.session_started_at;
                 self.awaiting_session_start = true;
-                self.status = "Enabling…".into();
+                self.status = ListenerStatus::Enabling;
                 self.error = None;
             }
             Err(error) => {
-                self.status = "Couldn't enable".into();
+                self.status = ListenerStatus::CouldNotEnable;
                 self.error = Some(tr_fill("Could not start listener: {}", &error.to_string()));
             }
         }
@@ -473,25 +570,25 @@ impl WindowsDesktopHost {
         }
         let mut candidate = self.settings.clone();
         candidate.enable_on_launch = enabled;
-        match save_listening(&candidate) {
-            Ok(()) => self.apply_settings(&candidate),
+        match save_listening(&self.settings, &candidate) {
+            Ok(saved) => self.apply_settings(&saved),
             Err(error) => tracing::warn!(%error, "could not save Enable on launch"),
         }
     }
 
     pub(crate) fn stop(&mut self) {
         self.listen_when_ready = false;
-        self.signal_stop("Disabling…");
+        self.signal_stop(ListenerStatus::Disabling);
     }
 
     fn is_running(&self) -> bool {
         self.listener.is_some()
     }
 
-    fn signal_stop(&mut self, status: &str) {
+    fn signal_stop(&mut self, status: ListenerStatus) {
         if let Some(listener) = &self.listener {
             listener.stop.store(true, Ordering::Relaxed);
-            self.status = status.into();
+            self.status = status;
         }
     }
 
@@ -506,6 +603,12 @@ impl WindowsDesktopHost {
             self.supersede_automatic();
         }
         let previous = std::mem::replace(&mut self.settings, settings.clone());
+        if self
+            .app_switcher
+            .configure(settings.labs.app_model_switching)
+        {
+            self.supersede_automatic();
+        }
         let current = settings;
         crate::feedback::set_enabled(current.sound_effects);
         crate::feedback::set_volume(current.sound_effect_volume.clamp(0.0, 1.0));
@@ -561,19 +664,20 @@ impl WindowsDesktopHost {
         }
         let mut candidate = self.settings.clone();
         candidate.remember_transcription(failed.kept);
-        match candidate.save() {
-            Ok(()) => self.apply_settings(&candidate),
+        match self.settings.update(&candidate) {
+            Ok(saved) => self.apply_settings(&saved),
             Err(error) => tracing::warn!(%error, "could not restore the running model setting"),
         }
         self.preparation.set_error(Some(failed.error));
     }
 
-    /// Hosts the personal transformations workspace while any mode uses a
-    /// transformation or the workspace exists.
+    /// Hosts the personal transformations workspace under the shared policy.
     fn refresh_personal_commands_host(&mut self) {
-        let enabled =
-            crate::app_settings::transformations_used(&self.settings.dictation_processing)
-                || crate::personal_commands::workspace_configured();
+        let enabled = crate::personal_commands::host_needed(
+            crate::personal_commands::custom_transformations_selected(
+                &self.settings.dictation_processing,
+            ),
+        );
         match (enabled, self.personal_commands.is_some()) {
             (true, false) => {
                 self.personal_commands =
@@ -603,14 +707,18 @@ impl WindowsDesktopHost {
 
     pub(crate) fn refresh(&mut self) {
         self.switch_with_keyboard();
+        self.switch_with_app();
         if let Some(result) = self.preparation.poll() {
             self.automatic_preparation = false;
             let result = result.and_then(|selection| {
                 crate::transcription::models::validate(&selection).map_err(|e| e.to_string())?;
                 let mut candidate = self.settings.clone();
                 candidate.remember_transcription(selection);
-                candidate.save().map_err(|e| format!("{e:#}"))?;
-                self.apply_settings(&candidate);
+                let saved = self
+                    .settings
+                    .update(&candidate)
+                    .map_err(|e| format!("{e:#}"))?;
+                self.apply_settings(&saved);
                 Ok(())
             });
             if let Err(error) = result {
@@ -625,13 +733,16 @@ impl WindowsDesktopHost {
         for failed in swap_failures {
             self.keep_running_model(failed);
         }
-        if self.listen_after_setup && crate::desktop::onboarding::completion_recorded() {
+        if self.listen_after_setup && self.setup_done() {
             self.listen_after_setup = false;
             self.start();
         }
         // Settings may set up the workspace at any time.
         if self.personal_commands_checked_at.elapsed() >= Duration::from_secs(2) {
             self.personal_commands_checked_at = Instant::now();
+            if !cfg!(test) {
+                self.reload_settings();
+            }
             self.refresh_personal_commands_host();
         }
         let mut start_listener = false;
@@ -650,11 +761,11 @@ impl WindowsDesktopHost {
                 }
                 match result {
                     Ok(()) => {
-                        self.status = "Disabled".into();
+                        self.status = ListenerStatus::Disabled;
                         start_listener = self.listen_when_ready;
                     }
                     Err(error) => {
-                        self.status = "Couldn't enable".into();
+                        self.status = ListenerStatus::CouldNotEnable;
                         self.error = Some(error);
                     }
                 }
@@ -676,7 +787,7 @@ impl WindowsDesktopHost {
             && !self.awaiting_session_start
             && let Some(status) = self.activity.state_label()
         {
-            self.status = status.into();
+            self.status = status;
         }
     }
 
@@ -699,7 +810,7 @@ impl WindowsDesktopHost {
             listener: DesktopListenerSnapshot {
                 running: self.is_running(),
                 warming: self.is_running() && self.awaiting_session_start,
-                status: self.status.clone(),
+                status: self.status,
                 warning: self.indicator.failure(),
                 last_failure: self
                     .activity
@@ -712,9 +823,7 @@ impl WindowsDesktopHost {
             transcription: DesktopTranscriptionSnapshot {
                 downloaded_bytes: preparation.downloaded_bytes,
                 error: preparation.error,
-                preparation_stage: preparation
-                    .model
-                    .map(|_| ModelPreparationStage::Downloading),
+                preparation_stage: preparation.stage,
                 selection: self.settings.transcription.clone(),
                 preparing: preparation.model,
             },
@@ -736,8 +845,33 @@ impl Drop for WindowsDesktopHost {
     }
 }
 
+/// The foreground application's executable stem, or `None` when Hex owns the
+/// foreground window or none is focused: Labs › Switch model with app matches
+/// applications only, never Hex's own window.
+pub(crate) fn foreground_other_process_stem() -> Option<String> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    // SAFETY: plain queries; a null window owns no process.
+    unsafe {
+        let window = GetForegroundWindow();
+        if window.is_null() {
+            return None;
+        }
+        let mut process_id = 0;
+        GetWindowThreadProcessId(window, &mut process_id);
+        if process_id == GetCurrentProcessId() {
+            return None;
+        }
+        let path = crate::windows::input::window_process_path(window)?;
+        Some(path.file_stem()?.to_string_lossy().to_lowercase())
+    }
+}
+
 /// The newest foreground window another process owns, polled with the
-/// runtime's refresh.
+/// runtime's refresh. The desktop and taskbars are skipped: a paste there is
+/// lost, so bringing one forward is never what Paste Last wants.
 #[derive(Default)]
 struct ForeignWindow(Option<isize>);
 
@@ -755,7 +889,9 @@ impl ForeignWindow {
             }
             let mut process_id = 0;
             GetWindowThreadProcessId(window, &mut process_id);
-            if process_id != GetCurrentProcessId() {
+            if process_id != GetCurrentProcessId()
+                && !crate::windows::paste::is_shell_window(window)
+            {
                 self.0 = Some(window as isize);
             }
         }
@@ -776,14 +912,14 @@ impl ForeignWindow {
 }
 
 #[cfg(not(test))]
-fn save_listening(settings: &AppSettings) -> Result<()> {
-    settings.save()
+fn save_listening(base: &AppSettings, settings: &AppSettings) -> Result<AppSettings> {
+    base.update(settings)
 }
 
 /// Tests never write the person's `settings.json`.
 #[cfg(test)]
-fn save_listening(_: &AppSettings) -> Result<()> {
-    Ok(())
+fn save_listening(_: &AppSettings, settings: &AppSettings) -> Result<AppSettings> {
+    Ok(settings.clone())
 }
 
 #[cfg(test)]

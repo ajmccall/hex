@@ -15,7 +15,7 @@
 ;
 ; Compile with scripts/build-windows-installer.ps1, which passes:
 ;   /DAppVersion=2.3.0 /DArch=x64|arm64 /DExecutable=<hex.exe> /DConsole=<hex.com>
-;   /DOutputDir=<dir>
+;   /DOutputDir=<dir> [/DSignedEngineDir=<dir of the signed uninst-*.e32>]
 ; Console is left out only to wrap a release published before hex.com.
 
 #ifndef AppVersion
@@ -73,6 +73,18 @@ RestartApplications=no
 ; Adding or removing bin on PATH reaches new terminals without signing out.
 ChangesEnvironment=yes
 MinVersion=10.0
+; Setup runs from a copy of its engine that it extracts to %TEMP%, and the
+; uninstaller it writes is another copy of it. Smart App Control
+; (VerifiedAndReputableDesktop) blocks an unsigned copy ("Unable to execute
+; file in the temporary directory", error 4551), so the engine must be signed.
+; SignedUninstaller embeds a signature in it: scripts/build-windows-installer.ps1
+; compiles once with -ExtractSignedEngine to leave the unsigned engine ISCC asks
+; to have signed, and again with -SignedEngineDir pointing at the signed file.
+; Without the define (Test builds) the compile is unchanged and unsigned.
+#ifdef SignedEngineDir
+SignedUninstaller=yes
+SignedUninstallerDir="{#SignedEngineDir}"
+#endif
 
 [Files]
 Source: "{#Executable}"; DestDir: "{app}\versions\{#AppVersion}"; DestName: "hex.exe"; Flags: ignoreversion
@@ -217,6 +229,20 @@ begin
   RegWriteExpandStringValue(HKCU, 'Environment', 'Path', Kept);
 end;
 
+{ Launch at login names a version's hex.exe, as src/windows/login_item.rs
+  writes it. Point an enabled one at this version, as the app's updater does,
+  so signing in doesn't start the version this replaced. A value outside the
+  managed versions folder is the user's and stays; a disabled one stays off. }
+procedure FollowLaunchAtLogin();
+var
+  Command: String;
+begin
+  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'Hex', Command) and
+     (Pos(LowerCase(ExpandConstant('{app}\versions\')), LowerCase(Command)) > 0) then
+    RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'Hex',
+      '"' + ExpandConstant('{app}\versions\{#AppVersion}\hex.exe') + '" app --hidden');
+end;
+
 { Point current-version at this version only once its files are in place,
   then mark the install as direct so the app updates itself
   (docs/plans/release-service.md). }
@@ -231,6 +257,7 @@ begin
     StringChangeEx(Root, '\', '\\', True);
     WriteUtf8Atomically(ExpandConstant('{app}\install.json'),
       '{"app":"hex","artifact":"desktop","channel":"stable","method":"direct","root":"' + Root + '"}');
+    FollowLaunchAtLogin();
 #ifdef Console
     AddBinToPath();
 #endif

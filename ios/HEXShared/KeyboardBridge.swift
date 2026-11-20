@@ -231,6 +231,13 @@ nonisolated struct KeyboardSnapshot: Codable, Equatable, Sendable {
     let resultExpiresAt: TimeInterval?
     let transcript: String?
     let message: String?
+    /// The raw transcript behind `transcript`, before cleanup and formatting, sent only while
+    /// Learn how I type is on so the keyboard can tell misheard words from formatting.
+    /// Nil when it can't be learned from (translated) or the experiment is off.
+    let heard: String?
+    /// Record typing logs: what each step of the dictation made of it, sent only while
+    /// that experiment is on.
+    let stages: DictationStages?
 
     init(
         state: KeyboardDictationState,
@@ -243,7 +250,9 @@ nonisolated struct KeyboardSnapshot: Codable, Equatable, Sendable {
         resultID: String? = nil,
         resultExpiresAt: TimeInterval? = nil,
         transcript: String? = nil,
-        message: String? = nil
+        message: String? = nil,
+        heard: String? = nil,
+        stages: DictationStages? = nil
     ) {
         self.state = state
         self.heartbeat = heartbeat
@@ -256,6 +265,8 @@ nonisolated struct KeyboardSnapshot: Codable, Equatable, Sendable {
         self.resultExpiresAt = resultExpiresAt
         self.transcript = transcript
         self.message = message
+        self.heard = heard
+        self.stages = stages
     }
 
     var effectiveLoudnessDB: Float {
@@ -302,7 +313,7 @@ nonisolated struct KeyboardSnapshot: Codable, Equatable, Sendable {
 
 @MainActor
 struct KeyboardBridge {
-    nonisolated static let appGroup = "group.com.kitlangton.hex.mobile"
+    nonisolated static let appGroup = "group.anomaly.hex.mobile"
 
     private enum Key {
         static let command = "keyboard.command"

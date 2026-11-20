@@ -529,7 +529,7 @@ fn view(plate_state: &Plate, cx: &mut Cx<Plate>) -> El {
     };
     root.child(plate(
         &p,
-        row().gap(8.0).children(mode).children(
+        row().gap(8.0).min_w(0.0).shrink().children(mode).children(
             (!plate_state.stable.trim().is_empty() || !plate_state.tentative.trim().is_empty())
                 .then_some(line),
         ),

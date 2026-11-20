@@ -11,9 +11,9 @@ use crate::app_settings::AppSettings;
 use crate::desktop::activity::{DesktopActivity, last_completed_at};
 use crate::desktop::events::EventReader;
 use crate::desktop::host::{
-    DesktopListenerSnapshot, DesktopShortcuts, DesktopTranscriptionSnapshot,
+    DesktopListenerSnapshot, DesktopShortcuts, DesktopTranscriptionSnapshot, ListenerStatus,
 };
-use crate::transcription::models::{ModelPreparationStage, TranscriptionSelection};
+use crate::transcription::models::TranscriptionSelection;
 use crate::transcription::preparation::TranscriptionPreparation;
 
 use super::{Published, RUNTIME_TICK, Request, Shared, UPDATER, lock, update_status};
@@ -36,6 +36,14 @@ pub(super) fn run_runtime(
             settings.keyboard_model_switching.clone(),
             initial_input_source,
         ),
+        app_switcher: crate::transcription::app_model_switching::Switcher::new(
+            settings.labs.app_model_switching,
+            settings
+                .labs
+                .app_model_switching
+                .then(|| crate::transcription::app_model_switching::startup_choice(&settings))
+                .flatten(),
+        ),
         automatic_preparation: false,
         settings,
         preparation: TranscriptionPreparation::default(),
@@ -46,6 +54,7 @@ pub(super) fn run_runtime(
         last_completed_at,
         started_at: shared.started_at,
     };
+    let mut settings_checked = Instant::now();
     loop {
         let mut next = match requests.recv_timeout(RUNTIME_TICK) {
             Ok(request) => Some(request),
@@ -59,13 +68,27 @@ pub(super) fn run_runtime(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+        if settings_checked.elapsed() >= std::time::Duration::from_secs(2) {
+            settings_checked = Instant::now();
+            runtime.reload_settings();
+        }
         runtime.tick();
         runtime.refresh_activity();
         let published = Arc::new(runtime.publish());
         let changed = {
             let mut current = lock(&shared.published);
-            let changed = current.as_deref() != Some(&published);
+            let changed = current.as_deref() != Some(&published)
+                || current.as_ref().is_some_and(|old| {
+                    old.settings.source.revision != published.settings.source.revision
+                });
             if changed {
+                if current.as_ref().is_none_or(|old| {
+                    old.settings.history_retention != published.settings.history_retention
+                }) && let Some(history) = super::runtime().and_then(|runtime| runtime.history())
+                    && let Err(error) = history.set_retention(published.settings.history_retention)
+                {
+                    tracing::warn!(%error, "could not apply history retention");
+                }
                 *current = Some(published);
             }
             changed
@@ -91,6 +114,8 @@ pub(super) struct Runtime {
     pub(super) settings: AppSettings,
     pub(super) preparation: TranscriptionPreparation,
     pub(super) keyboard_switcher: crate::transcription::keyboard_model_switching::Switcher,
+    /// Labs › Switch model with app: the foreground application's mode choice.
+    pub(super) app_switcher: crate::transcription::app_model_switching::Switcher,
     pub(super) automatic_preparation: bool,
     /// Starts the listener once setup is ready; `None` once started.
     pub(super) recognition_start: Option<SyncSender<()>>,
@@ -149,22 +174,30 @@ impl Runtime {
     }
 
     fn reload_settings(&mut self) {
-        match AppSettings::load() {
-            Ok(settings) => {
+        match self.settings.refreshed() {
+            Ok(Some(settings)) => {
                 if self
                     .keyboard_switcher
                     .configure(settings.keyboard_model_switching.clone(), Instant::now())
                 {
                     self.supersede_automatic();
                 }
+                if self
+                    .app_switcher
+                    .configure(settings.labs.app_model_switching)
+                {
+                    self.supersede_automatic();
+                }
                 self.settings = settings;
             }
+            Ok(None) => {}
             Err(error) => tracing::warn!(%error, "could not reload settings"),
         }
     }
 
     fn manual_choice(&mut self) {
         self.keyboard_switcher.manual_choice();
+        self.app_switcher.manual_choice();
         if self.automatic_preparation {
             self.preparation.cancel();
             self.automatic_preparation = false;
@@ -185,14 +218,8 @@ impl Runtime {
         self.tick_at(Instant::now());
     }
 
-    /// Reads the listener's newest events, bounded by `EventReader`'s
-    /// retention, so the window's warning follows failed dictations.
-    fn refresh_activity(&mut self) {
-        self.activity.refresh(&mut self.event_reader);
-        self.last_completed_at = last_completed_at(self.event_reader.events().iter());
-    }
-
-    pub(super) fn tick_at(&mut self, now: Instant) {
+    /// Follows the keyboard layout switcher's due choice, if any.
+    fn switch_with_keyboard(&mut self, now: Instant) {
         if let Some(choice) = self.keyboard_switcher.take_due(now) {
             let selection = TranscriptionSelection {
                 language: choice.language,
@@ -208,6 +235,75 @@ impl Runtime {
                 self.automatic_preparation = false;
             }
         }
+    }
+
+    /// Feeds one foreground read to the app switcher. Hex's own window and a
+    /// moment with no application in front carry no mode, so they leave the
+    /// last match and any switch it scheduled alone. A dictation that records
+    /// or transcribes holds a due switch until it finishes.
+    pub(super) fn follow_app(
+        &mut self,
+        observation: crate::transcription::app_model_switching::Observation<'_>,
+        now: Instant,
+    ) {
+        if !self.settings.labs.app_model_switching {
+            return;
+        }
+        if self.app_switcher.observe(
+            observation,
+            |application, bundle_name| {
+                crate::transcription::app_model_switching::mode_choice(
+                    &self.settings,
+                    application,
+                    bundle_name,
+                )
+            },
+            now,
+        ) {
+            self.supersede_automatic();
+        }
+        if crate::transcription::engine::dictation_busy() {
+            return;
+        }
+        let Some(choice) = self
+            .app_switcher
+            .take_due(now, &self.settings.transcription)
+        else {
+            return;
+        };
+        let selection = TranscriptionSelection {
+            language: choice.language,
+            ..self.settings.transcription_for_model(choice.model)
+        };
+        self.preparation.start(selection, true);
+        self.automatic_preparation = true;
+    }
+
+    /// Reads the listener's newest events, bounded by `EventReader`'s
+    /// retention, so the window's warning follows failed dictations.
+    fn refresh_activity(&mut self) {
+        self.activity.refresh(&mut self.event_reader);
+        self.last_completed_at = last_completed_at(self.event_reader.events().iter());
+    }
+
+    pub(super) fn tick_at(&mut self, now: Instant) {
+        self.switch_with_keyboard(now);
+        // Read the frontmost application only while the lab is on. Hex's own
+        // window names no mode and is ignored.
+        let (application, bundle_name) = self
+            .settings
+            .labs
+            .app_model_switching
+            .then(crate::dictation::context::frontmost_other_application)
+            .flatten()
+            .unzip();
+        self.follow_app(
+            crate::transcription::app_model_switching::Observation::frontmost(
+                application.as_deref(),
+                bundle_name.flatten().as_deref(),
+            ),
+            now,
+        );
         if let Some(result) = self.preparation.poll() {
             self.automatic_preparation = false;
             let result = result.and_then(|selection| {
@@ -244,13 +340,12 @@ impl Runtime {
                 running,
                 warming: false,
                 status: if failure.is_some() {
-                    "Stopped"
+                    ListenerStatus::Stopped
                 } else if running {
-                    "Enabled"
+                    ListenerStatus::Enabled
                 } else {
-                    "Waiting for setup"
-                }
-                .into(),
+                    ListenerStatus::WaitingForSetup
+                },
                 warning: failure,
                 notice: None,
                 last_failure: self
@@ -262,9 +357,7 @@ impl Runtime {
             transcription: DesktopTranscriptionSnapshot {
                 downloaded_bytes: preparation.downloaded_bytes,
                 error: preparation.error.clone(),
-                preparation_stage: preparation
-                    .model
-                    .map(|_| ModelPreparationStage::Downloading),
+                preparation_stage: preparation.stage,
                 selection: self.settings.transcription.clone(),
                 preparing: preparation.model,
             },

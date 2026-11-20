@@ -13,7 +13,12 @@ struct FullKeyboardSnapshotStage: View {
             return nil
         }
         let value = args[idx + 1]
-        return value.hasPrefix("full-keyboard-") ? value : nil
+        guard value.hasPrefix("full-keyboard-") else { return nil }
+        if let p = args.firstIndex(of: "--hex-placement"), p + 1 < args.count,
+           let placement = HexKeyPlacement(rawValue: args[p + 1]) {
+            HexKeyPlacement.current = placement
+        }
+        return value
     }
 
     private var darkField: Bool { scene.hasSuffix("-dark-field") }
@@ -32,6 +37,8 @@ struct FullKeyboardSnapshotStage: View {
         case "inserted": "Running 10 min late, should be home by 7:30. Start without me."
         case "numbers": "Running 10 min late, home by 7:3"
         case "shift": "Running 10 min late. "
+        case "typing": "Running 10 min teh"
+        case "accents": "Caf"
         default: "Running 10 min late, "
         }
     }
@@ -121,11 +128,14 @@ private struct FullKeyboardFixture: UIViewRepresentable {
         view.orientationOverride = .portrait
         view.drawsBackdrop = true
         view.prepareForField()
+        view.warmUpTextCheckerAsync()
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             switch state {
             case "pressed":
                 view.debugPress("g")
+            case "accents":
+                view.debugHoldAccent("e", selectIndex: 2)
             case "numbers":
                 view.engine.touchBegan(id: 900, at: center(of: .layerSwitch(.numbers), in: view))
                 view.engine.touchEnded(id: 900, at: center(of: .layerSwitch(.numbers), in: view))
@@ -144,6 +154,29 @@ private struct FullKeyboardFixture: UIViewRepresentable {
                 view.didInsertDictation("should be home by 7:30. Start without me.")
             case "style":
                 view.debugShowStyleMenu()
+            case "morph":
+                // Loops idle → recording → idle so the strip morph can be screen-recorded.
+                func cycle(_ start: TimeInterval) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                        model.configureFixture(
+                            snapshot: KeyboardSnapshot(
+                                state: .recording,
+                                heartbeat: start,
+                                expiresAt: start + 15 * 60,
+                                recordingStartedAt: start - 1,
+                                audioLevel: 0.7,
+                                loudnessDB: -30,
+                                jobID: "snap-job"
+                            ),
+                            now: start
+                        )
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) {
+                            model.configureFixture(snapshot: warm, now: start)
+                            cycle(start)
+                        }
+                    }
+                }
+                cycle(now)
             default:
                 break
             }
@@ -163,18 +196,44 @@ private func center(of kind: KeyKind, in view: FullKeyboardView) -> CGPoint {
 @MainActor
 final class FixtureTextTarget: KeyboardTextTarget {
     private(set) var text: String
+    private(set) var cursorIndex: Int
     let keyboardAppearance: UIKeyboardAppearance?
     var autocapitalizationType: UITextAutocapitalizationType? = .sentences
+    var autocorrectionType: UITextAutocorrectionType? = .default
     var keyboardType: UIKeyboardType? = .default
     var returnKeyType: UIReturnKeyType? = .default
+    var enablesReturnKeyAutomatically: Bool? = false
 
     init(text: String = "", appearance: UIKeyboardAppearance? = nil) {
         self.text = text
+        self.cursorIndex = text.count
         keyboardAppearance = appearance
     }
 
-    var documentContextBeforeInput: String? { text }
+    var documentContextBeforeInput: String? {
+        let clamped = max(0, min(text.count, cursorIndex))
+        let idx = text.index(text.startIndex, offsetBy: clamped)
+        return String(text[..<idx])
+    }
+
     var hasText: Bool { !text.isEmpty }
-    func insertText(_ inserted: String) { text += inserted }
-    func deleteBackward() { if !text.isEmpty { text.removeLast() } }
+
+    func insertText(_ inserted: String) {
+        let clamped = max(0, min(text.count, cursorIndex))
+        let idx = text.index(text.startIndex, offsetBy: clamped)
+        text.insert(contentsOf: inserted, at: idx)
+        cursorIndex = clamped + inserted.count
+    }
+
+    func deleteBackward() {
+        let clamped = max(0, min(text.count, cursorIndex))
+        guard clamped > 0 else { return }
+        let removeIdx = text.index(text.startIndex, offsetBy: clamped - 1)
+        text.remove(at: removeIdx)
+        cursorIndex = clamped - 1
+    }
+
+    func adjustTextPosition(byCharacterOffset offset: Int) {
+        cursorIndex = max(0, min(text.count, cursorIndex + offset))
+    }
 }

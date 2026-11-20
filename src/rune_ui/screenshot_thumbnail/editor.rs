@@ -14,11 +14,12 @@
 pub(crate) mod clip;
 mod export;
 pub(crate) mod marks;
+mod narration;
 mod view;
 
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -29,6 +30,10 @@ use self::export::{Export, deliver, load_sessions};
 use self::marks::{Mark, Rect, Tool};
 use crate::desktop::i18n::{tr, tr_fill};
 use crate::rune_ui::capture_capsule::surface::CHIP_H;
+pub(crate) use narration::Narration;
+use narration::{GENERATION, OPEN};
+#[cfg(target_os = "macos")]
+pub(crate) use narration::{can_claim, heard, listen, narration};
 
 /// Around the shot and the toolbar, inside the panel.
 const PAD: f32 = 8.0;
@@ -123,11 +128,16 @@ pub(crate) struct Editor {
     /// What was said over the shot, every dictation's words joined.
     words: String,
     listen: Listen,
+    generation: u64,
+    narration: Option<Arc<Narration>>,
     /// A send picked while a dictation was still going: it goes once the
     /// words land, and never if Escape cancels them.
     waiting: Option<Dest>,
     /// A short note and the animation seconds it appeared.
     note: Option<(String, f64)>,
+    /// An export that failed: its note stays beside Retry until the next
+    /// export.
+    failed: Option<Out>,
     on: bool,
     leaving: Option<f64>,
     now: f64,
@@ -256,7 +266,7 @@ impl Editor {
 
     fn close(&mut self, tx: &mut Tx) {
         if self.on {
-            OPEN.store(false, Ordering::Release);
+            *OPEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
             self.on = false;
             self.send = None;
             self.waiting = None;
@@ -303,6 +313,21 @@ impl Editor {
     fn note(&mut self, note: String, tx: &mut Tx) {
         self.note = Some((note, self.now));
         tx.wake_after(Duration::from_secs_f64(NOTE_S));
+    }
+
+    /// An export to `out` failed for the reason `note` gives: it stays
+    /// shown, with Retry, and nothing went out.
+    fn failed(&mut self, note: String, out: Out, tx: &mut Tx) {
+        self.note = Some((note, self.now));
+        self.failed = Some(out);
+        tx.animated();
+    }
+
+    /// The export that failed, again.
+    fn retry(&mut self, tx: &mut Tx) {
+        if let Some(out) = self.failed.clone() {
+            self.deliver(out, tx);
+        }
     }
 
     /// A drag on the shot, at `at` in its pixels.
@@ -391,10 +416,6 @@ impl Editor {
                 self.words.push(' ');
             }
             self.words.push_str(words);
-            #[cfg(target_os = "macos")]
-            if let Some(file) = &self.file {
-                crate::screenshots::remember_words(file.clone(), self.words.clone());
-            }
         }
         self.listen(Listen::Idle, tx);
     }
@@ -406,6 +427,9 @@ impl Editor {
             return false;
         }
         self.listen = Listen::Idle;
+        if let Some(request) = self.narration.take() {
+            request.cancelled.store(true, Ordering::Release);
+        }
         self.waiting = None;
         true
     }
@@ -415,6 +439,9 @@ impl Editor {
     fn deliver(&mut self, out: Out, tx: &mut Tx) {
         self.finish_typing();
         self.send = None;
+        if self.failed.take().is_some() {
+            self.note = None;
+        }
         if let Out::Send(dest) = &out
             && self.listen != Listen::Idle
         {
@@ -448,23 +475,24 @@ impl Editor {
         let spawned = std::thread::Builder::new()
             .name("hex-screenshot-export".into())
             .spawn(move || {
-                let note = match job.png().and_then(|png| deliver(&out, &png, &words)) {
-                    Ok(()) => match &out {
-                        Out::Copy => tr("Copied").to_owned(),
-                        Out::Save => tr("Saved").to_owned(),
-                        Out::Send(dest) => tr_fill("Sent to {}", &dest.name),
-                    },
-                    Err(error) => {
-                        tracing::warn!(%error, "could not export the edited screenshot");
-                        match &out {
-                            Out::Copy => tr("Couldn't copy").to_owned(),
-                            Out::Save => tr("Couldn't save").to_owned(),
-                            Out::Send(_) => tr("Couldn't send").to_owned(),
-                        }
-                    }
+                let result = job.png().and_then(|png| deliver(&out, &png, &words));
+                let Some(overlay) = overlay else {
+                    return;
                 };
-                if let Some(overlay) = overlay {
-                    overlay.update(move |s, tx| s.note(note, tx));
+                match result {
+                    Ok(()) => {
+                        let note = match &out {
+                            Out::Copy => tr("Copied").to_owned(),
+                            Out::Save => tr("Saved").to_owned(),
+                            Out::Send(dest) => tr_fill("Sent to {}", &dest.name),
+                        };
+                        overlay.update(move |s, tx| s.note(note, tx));
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "could not export the edited screenshot");
+                        let note = export_failure(&error, &out);
+                        overlay.update(move |s, tx| s.failed(note, out, tx));
+                    }
                 }
             });
         if let Err(error) = spawned {
@@ -498,26 +526,40 @@ impl Editor {
         let spawned = std::thread::Builder::new()
             .name("hex-recording-export".into())
             .spawn(move || {
-                let note = match job.deliver(&out) {
-                    Ok(()) => match &out {
-                        Out::Send(dest) => tr_fill("Sent to {}", &dest.name),
-                        _ => tr("Saved").to_owned(),
-                    },
+                let result = job.deliver(&out);
+                let Some(overlay) = overlay else {
+                    return;
+                };
+                match result {
+                    Ok(()) => {
+                        let note = match &out {
+                            Out::Send(dest) => tr_fill("Sent to {}", &dest.name),
+                            _ => tr("Saved").to_owned(),
+                        };
+                        overlay.update(move |s, tx| s.note(note, tx));
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "could not export the recording");
-                        match &out {
-                            Out::Send(_) => tr("Couldn't send").to_owned(),
-                            _ => tr("Couldn't save").to_owned(),
-                        }
+                        let note = export_failure(&error, &out);
+                        overlay.update(move |s, tx| s.failed(note, out, tx));
                     }
-                };
-                if let Some(overlay) = overlay {
-                    overlay.update(move |s, tx| s.note(note, tx));
                 }
             });
         if let Err(error) = spawned {
             tracing::warn!(%error, "could not start a recording export");
         }
+    }
+}
+
+/// What the editor says when an export to `out` failed with `error`.
+fn export_failure(error: &anyhow::Error, out: &Out) -> String {
+    if error.downcast_ref::<export::MarksNotDrawn>().is_some() {
+        return tr("Couldn't draw your marks").to_owned();
+    }
+    match out {
+        Out::Copy => tr("Couldn't copy").to_owned(),
+        Out::Save => tr("Couldn't save").to_owned(),
+        Out::Send(_) => tr("Couldn't send").to_owned(),
     }
 }
 
@@ -636,7 +678,9 @@ fn poll(s: &mut Editor, now: f64, tx: &mut Tx) -> bool {
         tx.wake_after(Duration::from_secs_f64(at + LEAVE_S - now));
         return false;
     }
-    if let Some((_, at)) = &s.note {
+    if let Some((_, at)) = &s.note
+        && s.failed.is_none()
+    {
         let left = at + NOTE_S - now;
         if left <= 0.0 {
             s.note = None;
@@ -650,8 +694,6 @@ fn poll(s: &mut Editor, now: f64, tx: &mut Tx) -> bool {
 // ─── Opening, exporting, sending ─────────────────────────────────────────────
 
 static EDITOR: OnceLock<OverlayHandle<Editor>> = OnceLock::new();
-/// Whether a shot is open, for the listener's thread.
-static OPEN: AtomicBool = AtomicBool::new(false);
 
 /// What the microphone chip and Escape ask of the listener.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -667,35 +709,6 @@ fn talk(talk: Talk) {
     crate::screenshots::narration::talk(talk);
     #[cfg(not(target_os = "macos"))]
     let _ = talk;
-}
-
-/// Whether a shot is open in the editor. Safe from any thread.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn is_open() -> bool {
-    OPEN.load(Ordering::Acquire)
-}
-
-/// A dictation over the open shot is now `listen`. Safe from any thread.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn listen(listen: Listen) {
-    if let Some(overlay) = EDITOR.get() {
-        overlay.update(move |s, tx| {
-            s.listen(listen, tx);
-            tx.animated();
-        });
-    }
-}
-
-/// A dictation over the open shot ended with `words`, or none. Safe from
-/// any thread.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn heard(words: Option<String>) {
-    if let Some(overlay) = EDITOR.get() {
-        overlay.update(move |s, tx| {
-            s.heard(words, tx);
-            tx.animated();
-        });
-    }
 }
 
 /// Adds the editor's overlay, hidden. Hidden, it holds no GPU surface.
@@ -751,7 +764,7 @@ pub(crate) fn open_recording(movie: PathBuf, words: Vec<clip::Word>) {
             let handle = overlay.clone();
             overlay.update(move |s, tx| {
                 // Dictation stays dictation: nothing talks over a recording.
-                OPEN.store(false, Ordering::Release);
+                *OPEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 s.load_clip(clip, screen);
                 handle.show();
                 handle.request_keys();
@@ -787,7 +800,9 @@ pub(crate) fn open_with(path: PathBuf, words: String) {
                 s.words = words;
                 s.listen = Listen::Idle;
                 s.waiting = None;
-                OPEN.store(true, Ordering::Release);
+                s.generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+                *OPEN.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((s.generation, s.file.clone().unwrap()));
                 handle.show();
                 handle.request_keys();
                 tx.animated();

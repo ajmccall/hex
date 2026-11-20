@@ -42,19 +42,6 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use color_eyre::eyre::{Result, WrapErr, eyre};
-use scrawl_capture::audio::RecordedAudio;
-use scrawl_capture::capture::{
-    AudioIn, ConfigSource, Event, Host, InputSink, MovieQuality, OwnWindows,
-    SharedCaptureTelemetry, SharedResources, Stage, Start, Target,
-};
-use scrawl_capture::handoff::EngineConfig;
-use scrawl_capture::hosted_input::{HostInput, HostedInput, Modifiers};
-use scrawl_capture::model::{TranscriptData, WordTiming};
-#[cfg(target_os = "macos")]
-use scrawl_capture::transcribe::AppleTranscriber;
-use scrawl_capture::transcribe::Transcriber;
-
 use crate::audio::CaptureInstant;
 #[cfg(target_os = "macos")]
 pub use crate::audio::recording_environment::RecordingEnvironmentController as Environment;
@@ -68,11 +55,23 @@ use crate::control::{
 use crate::dictation::audio::DictationAudio;
 use crate::transcription::engine::TranscriptionEngine;
 use crate::transcription::models::{ModelRuntime, TranscriptionModelId};
+use color_eyre::eyre::{Result, WrapErr, eyre};
+use scrawl_capture::audio::RecordedAudio;
+use scrawl_capture::capture::{
+    AudioIn, ConfigSource, Event, Host, InputSink, MovieQuality, OwnWindows,
+    SharedCaptureTelemetry, SharedResources, Stage, Start, Target,
+};
+use scrawl_capture::handoff::EngineConfig;
+use scrawl_capture::hosted_input::{HostInput, HostedInput, Modifiers};
+use scrawl_capture::model::WordTiming;
+use scrawl_capture::transcribe::Transcriber;
 
 // `hex annotate`'s folder commands; Windows has no control transport for
 // them yet.
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 mod library;
+#[cfg(target_os = "macos")]
+pub(crate) mod paste_source;
 mod permissions;
 mod replay;
 mod routing;
@@ -80,6 +79,8 @@ mod routing;
 mod screen_access;
 mod sink;
 mod timeline;
+mod wav_file;
+mod words;
 
 pub use library::{
     explain as explain_capture, list as list_captures, send as send_capture, show as show_capture,
@@ -93,7 +94,7 @@ pub use permissions::{
 };
 pub use replay::available as replay_available;
 pub use routing::CaptureRoute;
-pub use routing::{RouteAnswer, RouteDelivery, RouteDest};
+pub use routing::{RouteAnswer, RouteDelivery, RouteDest, SEND_HOLD};
 #[cfg(target_os = "macos")]
 pub use routing::{recent_sessions, send_image};
 #[cfg(target_os = "macos")]
@@ -104,6 +105,7 @@ pub use sink::CaptureSink;
 pub use sink::ListenerTimeline;
 pub use sink::{CaptureAudio, CaptureSinkClosed};
 use timeline::Timeline;
+use words::ChosenTranscriber;
 
 /// "While dictating" for a capture on Linux: its own audio suppressor, made
 /// when the capture starts and restoring what it changed when dropped.
@@ -147,7 +149,8 @@ const SINK_CAPACITY: usize = 512;
 const EVENT_CAPACITY: usize = 64;
 const SAMPLE_RATE: u32 = 16_000;
 /// A capture keeps at most this much audio; the rest is recorded as a gap.
-const MAX_CAPTURE: Duration = Duration::from_secs(20 * 60);
+/// It bounds disk use only: the audio streams to `audio.wav.partial`, never memory.
+const MAX_CAPTURE: Duration = Duration::from_secs(8 * 60 * 60);
 const GAP_TOLERANCE: Duration = Duration::from_millis(50);
 /// How long shutdown waits for capture threads, inside the quit deadline.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
@@ -300,9 +303,8 @@ pub enum CaptureCommand {
     /// The pointer is on the capsule (`true`) or left it: a rule's send
     /// still waiting out its Undo window pauses while it is there.
     Hold(bool),
-    /// Pastes the newest written capture into the app in front, as
-    /// Scrawl's Paste chip does: its contact sheet, then its summary.
-    Paste,
+    /// Pastes the capsule's written capture, never a later completion.
+    Paste(PathBuf),
     /// Opens the newest written capture's contact sheet: Hex has no review
     /// window, and opening the bundle could launch Scrawl.app, which takes
     /// captures over.
@@ -350,6 +352,8 @@ struct Written {
     words: usize,
     /// Spans of its audio that went missing.
     gaps: usize,
+    /// Where its audio stops, when Hex had to stop keeping it.
+    audio_stopped_at_ms: Option<u64>,
     /// Why it has no transcript, if it has none.
     missing_transcript: Option<String>,
 }
@@ -399,6 +403,7 @@ impl Sealed for scrawl_capture::capture::SealedCapture {
         Ok(Written {
             words: finished.words,
             gaps: finished.gaps,
+            audio_stopped_at_ms: finished.bundle.audio_stopped_at_ms,
             missing_transcript: finished.missing_transcript,
         })
     }
@@ -476,13 +481,10 @@ impl Host for HexHost {
 /// looks through for clicks: the ink overlay, and the capsule's panel, which
 /// lets clicks through everywhere but its pill. Clicks on the pill never
 /// reach the engine ([`CapsulePill`]).
-fn own_windows_of(own: &[Option<u32>; 3]) -> OwnWindows {
+fn own_windows_of(own: &OwnWindowIds) -> OwnWindows {
     OwnWindows {
-        excluded: own.iter().flatten().copied().collect(),
-        passthrough: [OwnWindow::Ink, OwnWindow::Capsule]
-            .into_iter()
-            .filter_map(|role| own[role as usize])
-            .collect(),
+        excluded: own.excluded(),
+        passthrough: [own.ink, own.capsule].into_iter().flatten().collect(),
         recorded: Arc::clone(&OWN_WINDOWS_RECORDED),
     }
 }
@@ -551,7 +553,8 @@ impl CapsulePill {
         };
         let Some(window) = OWN_WINDOWS
             .lock()
-            .unwrap_or_else(|error| error.into_inner())[OwnWindow::Capsule as usize]
+            .unwrap_or_else(|error| error.into_inner())
+            .capsule
         else {
             return false;
         };
@@ -587,7 +590,31 @@ fn on_pill(origin: [f64; 2], pill: [f32; 4], x: f64, y: f64) -> bool {
 
 /// Hex's windows a capture leaves out of its recording, one per role. A
 /// capture reads them when it starts.
-static OWN_WINDOWS: Mutex<[Option<u32>; 3]> = Mutex::new([None, None, None]);
+static OWN_WINDOWS: Mutex<OwnWindowIds> = Mutex::new(OwnWindowIds {
+    capsule: None,
+    ink: None,
+    picker: None,
+});
+
+/// The window holding each [`OwnWindow`] role.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnWindowIds {
+    capsule: Option<u32>,
+    ink: Option<u32>,
+    picker: Option<u32>,
+}
+
+impl OwnWindowIds {
+    /// Every window held, which a recording leaves out.
+    fn excluded(self) -> Vec<u32> {
+        let Self {
+            capsule,
+            ink,
+            picker,
+        } = self;
+        [capsule, ink, picker].into_iter().flatten().collect()
+    }
+}
 
 /// Which of Hex's windows a capture leaves out.
 #[derive(Clone, Copy, Debug)]
@@ -608,7 +635,11 @@ pub fn exclude_window(role: OwnWindow, window: u32) {
     let mut own = OWN_WINDOWS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    own[role as usize] = Some(window);
+    *match role {
+        OwnWindow::Capsule => &mut own.capsule,
+        OwnWindow::Ink => &mut own.ink,
+        OwnWindow::Picker => &mut own.picker,
+    } = Some(window);
     let joined = own_windows_of(&own);
     drop(own);
     let Some(source) = ink_source() else { return };
@@ -686,133 +717,11 @@ fn shared_engine(
     Ok(made)
 }
 
-/// The transcriber `capture.transcriber` names when a capture is written.
-struct ChosenTranscriber;
-
-impl Transcriber for ChosenTranscriber {
-    fn transcribe(&self, audio: &RecordedAudio) -> anyhow::Result<Option<TranscriptData>> {
-        match crate::app_settings::capture_settings().transcriber {
-            crate::app_settings::CaptureTranscriber::Parakeet => HexTranscriber {
-                engine: DICTATION_ENGINE
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone(),
-            }
-            .transcribe(audio),
-            #[cfg(target_os = "macos")]
-            crate::app_settings::CaptureTranscriber::Apple => {
-                AppleTranscriber::default().transcribe(audio)
-            }
-            // Apple's SpeechAnalyzer is macOS's; elsewhere it is Hex's model.
-            #[cfg(not(target_os = "macos"))]
-            crate::app_settings::CaptureTranscriber::Apple => HexTranscriber {
-                engine: DICTATION_ENGINE
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone(),
-            }
-            .transcribe(audio),
-        }
-    }
-}
-
-/// Word-timed transcription on the dictation engine's loaded model. It holds
-/// the engine weakly, so a capture still writing never keeps it alive.
-struct HexTranscriber {
-    engine: Option<Weak<TranscriptionEngine>>,
-}
-
-impl Transcriber for HexTranscriber {
-    /// Word times are milliseconds from `audio.samples[0]`; the engine moves
-    /// them onto the capture's clock and builds the segments.
-    fn transcribe(&self, audio: &RecordedAudio) -> anyhow::Result<Option<TranscriptData>> {
-        let Some(engine) = &self.engine else {
-            return Ok(None);
-        };
-        let samples = if audio.sample_rate == SAMPLE_RATE {
-            audio.samples.clone()
-        } else {
-            crate::dictation::try_resample_for_parakeet(&audio.samples, audio.sample_rate)
-                .map_err(|error| anyhow::anyhow!(error))?
-        };
-        let (_, selection) = crate::app_settings::transcription_selection();
-        let (text, words) = transcribe_words(engine, &selection, samples)
-            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
-        Ok(Some(TranscriptData {
-            source: "hex".into(),
-            model: Some(selection.model.as_str().into()),
-            text,
-            words: corrected_words(words, word_lag(selection.model)),
-            ..TranscriptData::default()
-        }))
-    }
-}
-
 /// One word and its times, in ms from the clip's start.
 pub struct TimedWord {
     pub start_ms: i64,
     pub end_ms: i64,
     pub text: String,
-}
-
-/// The clip's text and words on the dictation engine's warm model.
-#[cfg(target_os = "macos")]
-fn transcribe_words(
-    engine: &Weak<TranscriptionEngine>,
-    selection: &crate::transcription::models::TranscriptionSelection,
-    samples: Vec<f32>,
-) -> Result<(String, Vec<TimedWord>)> {
-    let transcript = crate::parakeet::transcribe_with_words(engine, selection, samples)?;
-    let words = transcript
-        .words
-        .into_iter()
-        .map(|word| TimedWord {
-            start_ms: word.start_ms,
-            end_ms: word.end_ms,
-            text: word.text,
-        })
-        .collect();
-    Ok((transcript.text, words))
-}
-
-/// The clip's text and words, as one foreground request on the Linux or
-/// Windows listener's engine: after the dictation already sent, never inside
-/// a live stream. Its model is whatever the listener has loaded.
-#[cfg(not(target_os = "macos"))]
-fn transcribe_words(
-    engine: &Weak<TranscriptionEngine>,
-    _selection: &crate::transcription::models::TranscriptionSelection,
-    samples: Vec<f32>,
-) -> Result<(String, Vec<TimedWord>)> {
-    if samples.is_empty() {
-        return Ok((String::new(), Vec::new()));
-    }
-    let (send, transcript) = mpsc::sync_channel(1);
-    let offline: crate::transcription::engine::Offline = Box::new(move |model, samples| {
-        let (text, words) = model
-            .transcribe_words(&samples)
-            .map_err(|error| format!("{error:#}"))?;
-        let _ = send.send((text.clone(), words));
-        Ok(text)
-    });
-    engine
-        .upgrade()
-        .ok_or_else(|| eyre!("the transcription engine stopped"))?
-        .foreground(samples, offline)?
-        .wait()
-        .map_err(|error| eyre!(error))?;
-    let (text, words) = transcript
-        .try_recv()
-        .map_err(|_| eyre!("the transcription returned no words"))?;
-    let words = words
-        .into_iter()
-        .map(|(start_ms, end_ms, text)| TimedWord {
-            start_ms,
-            end_ms,
-            text,
-        })
-        .collect();
-    Ok((text, words))
 }
 
 /// How late a model's word times run, in ms: the median against Apple's
@@ -1106,9 +1015,14 @@ pub struct SettledCapture {
     /// no transcript, if it has none.
     pub words: Option<usize>,
     pub gaps: Option<usize>,
+    /// Where a written capture's audio stops, when Hex had to stop keeping it.
+    pub audio_stopped_at_ms: Option<u64>,
     pub missing_transcript: Option<String>,
     /// Why a capture failed, when Hex knows.
     pub error: Option<String>,
+    /// Why a written capture's summary didn't reach the clipboard; `None`
+    /// once it did (or for a capture that isn't copied).
+    pub copy_error: Option<String>,
     /// Where a written capture goes, while captures are sent to OpenCode
     /// (`capture.routing`'s `autoSend`).
     pub route: Option<CaptureRoute>,
@@ -1121,6 +1035,7 @@ impl SettledCapture {
             stage: self.stage.label().into(),
             words: self.words,
             gaps: self.gaps,
+            audio_stopped_at_ms: self.audio_stopped_at_ms,
             missing_transcript: self.missing_transcript.clone(),
         }
     }
@@ -1350,11 +1265,11 @@ impl Outcomes {
     }
 
     fn settle(&mut self, bundle: PathBuf, stage: Stage, written: Option<Written>) {
-        self.settle_with(bundle, stage, written, None, None);
+        self.settle_with(bundle, stage, written, None, None, None);
     }
 
     fn fail(&mut self, bundle: PathBuf, error: String) {
-        self.settle_with(bundle, Stage::Failed, None, Some(error), None);
+        self.settle_with(bundle, Stage::Failed, None, Some(error), None, None);
     }
 
     /// A switch discarded `bundle` and then could not start: its outcome,
@@ -1365,8 +1280,10 @@ impl Outcomes {
             stage: Stage::Failed,
             words: None,
             gaps: None,
+            audio_stopped_at_ms: None,
             missing_transcript: None,
             error: Some(error),
+            copy_error: None,
             route: None,
         });
         self.publish();
@@ -1396,6 +1313,7 @@ impl Outcomes {
         stage: Stage,
         written: Option<Written>,
         error: Option<String>,
+        copy_error: Option<String>,
         route: Option<CaptureRoute>,
     ) {
         let discarded = self
@@ -1409,8 +1327,12 @@ impl Outcomes {
                 stage,
                 words: written.as_ref().map(|written| written.words),
                 gaps: written.as_ref().map(|written| written.gaps),
+                audio_stopped_at_ms: written
+                    .as_ref()
+                    .and_then(|written| written.audio_stopped_at_ms),
                 missing_transcript: written.and_then(|written| written.missing_transcript),
                 error,
+                copy_error,
                 route,
             });
         }
@@ -1848,8 +1770,8 @@ impl CaptureHost {
             }
             CaptureCommand::Undo => Ok(self.route(routing::Job::Undo)),
             CaptureCommand::Hold(on) => Ok(self.route(routing::Job::Hold(on))),
-            CaptureCommand::Paste => self.hand_off(HandOff::Paste),
-            CaptureCommand::Inspect => self.hand_off(HandOff::Inspect),
+            CaptureCommand::Paste(bundle) => self.hand_off(HandOff::Paste, Some(bundle)),
+            CaptureCommand::Inspect => self.hand_off(HandOff::Inspect, None),
         };
         result.unwrap_or_else(|error| ControlReply::error("failed", format!("{error:#}")))
     }
@@ -2136,12 +2058,15 @@ impl CaptureHost {
 
     /// Pastes or opens the newest written capture on a thread of its own,
     /// one at a time: pasting waits on the pasteboard and the app in front.
-    fn hand_off(&self, how: HandOff) -> Result<ControlReply> {
-        let bundle = lock(&self.outcomes)
-            .last
-            .as_ref()
-            .filter(|last| last.stage == Stage::Done)
-            .map(|last| last.bundle.clone())
+    fn hand_off(&self, how: HandOff, shown: Option<PathBuf>) -> Result<ControlReply> {
+        let bundle = shown
+            .or_else(|| {
+                lock(&self.outcomes)
+                    .last
+                    .as_ref()
+                    .filter(|last| last.stage == Stage::Done)
+                    .map(|last| last.bundle.clone())
+            })
             .ok_or_else(|| eyre!("no written capture"))?;
         if !cfg!(test) {
             static HANDING_OFF: AtomicBool = AtomicBool::new(false);
@@ -2517,14 +2442,59 @@ fn as_pen(event: scrawl_capture::capture::InputEvent) -> scrawl_capture::capture
     }
 }
 
-/// A pointer move on the drawing overlay, at `x`, `y` in its points;
-/// `scale` is its pixels per point (Linux). The capture's target becomes
-/// the recorded screen in points, so strokes land where they were drawn:
-/// the portal's logical size when it gives one, since a fractional scale
-/// (1.5, 1.33) reaches the overlay rounded up to a whole number, which
-/// would shrink the target and pin strokes past it to its edge.
+/// The ink overlay's own space on Linux: the window its pointer moves in
+/// and the points its strokes are drawn in.
 #[cfg(target_os = "linux")]
-pub fn draw(x: f32, y: f32, scale: f32) {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InkSpace {
+    /// The overlay is the XWayland window a compositor without layer-shell
+    /// gets (GNOME).
+    pub xwayland: bool,
+    /// The overlay's size in its own points, as the view laid it out, once
+    /// known (`Cx::layout_size`).
+    pub viewport: Option<[f32; 2]>,
+}
+
+/// The recorded screen in the ink overlay's points, so strokes land where
+/// they were drawn.
+///
+/// A native Wayland layer surface lays out in the desktop's logical points,
+/// which the portal's stream `size` (or the named output's xdg-output size)
+/// gives exactly, even at a fractional scale the overlay's integer buffer
+/// scale rounds up.
+///
+/// The XWayland window GNOME gets instead lays out in its own points, and
+/// the desktop's logical size is another space there: a compositor that
+/// scales XWayland natively leaves the overlay at the screen's pixels while
+/// the portal still reports the smaller logical layout (1536x960 for a
+/// 1920x1200 screen at 125%), so using it pins every stroke past 80% of the
+/// screen to the target's edge; one that scales X11 traditionally leaves the
+/// overlay at the logical layout while the stream is the screen's pixels. The
+/// overlay's own size is the only source right in both, and before the view
+/// knows it the recorded pixels over the overlay's scale stand in.
+#[cfg(target_os = "linux")]
+fn ink_points(
+    pixels: (u32, u32),
+    scale: f32,
+    logical: Option<(f64, f64)>,
+    space: InkSpace,
+) -> [f32; 2] {
+    let in_points = [pixels.0 as f32 / scale, pixels.1 as f32 / scale];
+    if space.xwayland {
+        return space
+            .viewport
+            .filter(|[width, height]| *width > 0.0 && *height > 0.0)
+            .unwrap_or(in_points);
+    }
+    logical.map_or(in_points, |(width, height)| [width as f32, height as f32])
+}
+
+/// A pointer move on the drawing overlay, at `x`, `y` in its points;
+/// `scale` is its pixels per point, and `space` is where it lays out
+/// (Linux). The capture's target becomes the recorded screen in that same
+/// space, so strokes land where they were drawn ([`ink_points`]).
+#[cfg(target_os = "linux")]
+pub fn draw(x: f32, y: f32, scale: f32, space: InkSpace) {
     if !drawing() {
         return;
     }
@@ -2532,12 +2502,9 @@ pub fn draw(x: f32, y: f32, scale: f32) {
         && scale > 0.0
         && let Some(source) = ink_source()
     {
-        let area = crate::linux::output::pen_points()
-            .or_else(scrawl_capture::capture::recorded_screen_points)
-            .map_or(
-                [width as f32 / scale, height as f32 / scale],
-                |(width, height)| [width as f32, height as f32],
-            );
+        let logical = crate::linux::output::pen_points()
+            .or_else(scrawl_capture::capture::recorded_screen_points);
+        let area = ink_points((width, height), scale, logical, space);
         let mut frame = source
             .telemetry
             .target_frame
@@ -3210,7 +3177,10 @@ fn takes(keys: CapsuleKeys, key: &CapsuleKey) -> bool {
             CapsuleKey::Shortcut | CapsuleKey::Press | CapsuleKey::Shift(_),
         ) => true,
         (
-            CapsuleKeys::Suggest { cycle: true, .. },
+            CapsuleKeys::Suggest {
+                cycle: true,
+                search: true,
+            },
             CapsuleKey::Return { shift: false } | CapsuleKey::Tab { .. },
         ) => true,
         (CapsuleKeys::Suggest { search: true, .. }, CapsuleKey::Text(typed)) => opens_search(typed),
@@ -3342,9 +3312,26 @@ fn finish_captures(
                     missing_transcript = written.missing_transcript.as_deref(),
                     "capture finished"
                 );
-                copy_to_clipboard(&bundle);
+                let copy_error = if crate::capture_zip::copy_as_zip(&bundle) {
+                    None
+                } else {
+                    copy_to_clipboard(&bundle)
+                        .err()
+                        .map(|error| format!("{error:#}"))
+                };
                 let route = look.as_ref().map(|_| CaptureRoute::looking());
-                lock(outcomes).settle_with(bundle.clone(), Stage::Done, Some(written), None, route);
+                #[cfg(target_os = "macos")]
+                if let Err(error) = paste_source::mark_ready(&bundle, crate::history::now_ms()) {
+                    tracing::warn!(%error, "capture written without Paste Last provenance");
+                }
+                lock(outcomes).settle_with(
+                    bundle.clone(),
+                    Stage::Done,
+                    Some(written),
+                    None,
+                    copy_error,
+                    route,
+                );
                 if let Some(look) = look {
                     let job = routing::Job::Written {
                         bundle: bundle.clone(),
@@ -3452,32 +3439,18 @@ fn summary(bundle: &Path) -> anyhow::Result<String> {
 /// The process's one paster for captures. On X11 it serves the clipboard
 /// for as long as it lives, so a copied capture stays pasteable.
 #[cfg(target_os = "linux")]
-fn with_linux_paster(
+pub(crate) fn with_linux_paster(
     use_it: impl FnOnce(&mut crate::linux::paste::LinuxPaster) -> Result<()>,
 ) -> anyhow::Result<()> {
-    static PASTER: Mutex<Option<crate::linux::paste::LinuxPaster>> = Mutex::new(None);
-    let mut paster = PASTER.lock().unwrap_or_else(|error| error.into_inner());
-    if paster.is_none() {
-        let shift = crate::app_settings::AppSettings::load()
-            .map(|settings| settings.paste_with_shift)
-            .unwrap_or(false);
-        *paster = Some(
-            crate::linux::paste::LinuxPaster::new(
-                Arc::default(),
-                Arc::new(AtomicBool::new(shift)),
-                Default::default(),
-            )
-            .map_err(|error| anyhow::anyhow!("{error:#}"))?,
-        );
-    }
-    use_it(paster.as_mut().expect("made above")).map_err(|error| anyhow::anyhow!("{error:#}"))
+    crate::linux::paste::with_paster(use_it).map_err(|error| anyhow::anyhow!("{error:#}"))
 }
 
 /// Copies a written capture to the clipboard, as Scrawl does: its summary,
-/// ready to paste into an agent.
-fn copy_to_clipboard(bundle: &Path) {
+/// ready to paste into an agent. The capsule says "Summary copied" only
+/// once this is `Ok`.
+fn copy_to_clipboard(bundle: &Path) -> anyhow::Result<()> {
     if cfg!(test) {
-        return;
+        return Ok(());
     }
     #[cfg(target_os = "macos")]
     let copied =
@@ -3487,9 +3460,10 @@ fn copy_to_clipboard(bundle: &Path) {
         summary(bundle).and_then(|summary| with_linux_paster(|paster| paster.copy(&summary)));
     #[cfg(target_os = "windows")]
     let copied = scrawl_capture::handoff::copy_bundle_to_clipboard(bundle);
-    if let Err(error) = copied {
+    if let Err(error) = &copied {
         tracing::warn!(error = format!("{error:#}"), "could not copy the capture");
     }
+    copied.map_err(|error| anyhow::anyhow!("{error:#}"))
 }
 
 /// One capture's audio thread: starts the engine, collects until the sink
@@ -3528,7 +3502,7 @@ fn collect(
             return;
         }
     };
-    let mut timeline = Timeline::new(t0);
+    let mut timeline = Timeline::new(t0, bundle.join("audio.wav"));
     // A Screenshots recording goes to its card, never the router.
     let routed = !lock(outcomes).is_clip(&bundle);
     let prepared = routed
@@ -3559,6 +3533,8 @@ fn collect(
                 tracing::error!(error, "the capture's screen source failed");
                 input.detach(&bundle);
                 drop(chunks);
+                // Close and remove the partial audio before the bundle is removed.
+                timeline.discard();
                 capture.cancel();
                 remove_bundle(&bundle);
                 lock(outcomes).fail(bundle, error);
@@ -3601,7 +3577,11 @@ fn collect(
                 }
             }
         }
-        Ok(Seal::Cancel) | Err(_) => capture.cancel(),
+        Ok(Seal::Cancel) | Err(_) => {
+            // Close and remove the partial audio before the bundle is removed.
+            timeline.discard();
+            capture.cancel();
+        }
     }
     lock(outcomes).settle(bundle, Stage::Cancelled, None);
 }
@@ -3731,7 +3711,8 @@ impl AudioTimeline for WavTimeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scrawl_capture::audio::GapSpan;
+    use scrawl_capture::audio::{GapSpan, pcm16};
+    use scrawl_capture::model::TranscriptData;
 
     /// A pen release on the `capture-input` thread ends its stroke while
     /// that thread holds the input target's lock; reading the ink must not
@@ -3751,6 +3732,65 @@ mod tests {
             "ending a stroke under the input lock deadlocked"
         );
         held.join().expect("the thread finishes");
+    }
+
+    /// The ink's target is the overlay's own space: the desktop's logical
+    /// points on a Wayland layer surface, and the XWayland window's own
+    /// points when GNOME has no layer-shell. #1995: a 1920x1200 screen at
+    /// 125% reported 1536x960 from the portal, and ink stopped at 1536/1920
+    /// of the screen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_ink_target_is_the_overlay_s_own_space() {
+        let layer = InkSpace {
+            xwayland: false,
+            viewport: None,
+        };
+        let xwayland = |viewport| InkSpace {
+            xwayland: true,
+            viewport,
+        };
+        // GNOME scaling XWayland natively: the overlay is the screen's
+        // 1920x1200 pixels at Xft's 1, and the portal's 1536x960 is the
+        // desktop's logical layout, which it must not use.
+        assert_eq!(
+            ink_points(
+                (1920, 1200),
+                1.0,
+                Some((1536.0, 960.0)),
+                xwayland(Some([1920.0, 1200.0])),
+            ),
+            [1920.0, 1200.0]
+        );
+        // GNOME scaling XWayland traditionally: the X root, and the overlay,
+        // is the logical 1536x960 at Xft's 1 while the stream is still the
+        // screen's 1920x1200 pixels, so the pixels over that scale would
+        // confine every stroke to 80% of the screen.
+        assert_eq!(
+            ink_points(
+                (1920, 1200),
+                1.0,
+                Some((1536.0, 960.0)),
+                xwayland(Some([1536.0, 960.0])),
+            ),
+            [1536.0, 960.0]
+        );
+        // Before the view has laid the overlay out: the pixels over its
+        // scale.
+        assert_eq!(
+            ink_points((1920, 1200), 1.0, Some((1536.0, 960.0)), xwayland(None)),
+            [1920.0, 1200.0]
+        );
+        // A Wayland layer surface lays out in the desktop's logical points,
+        // where a fractional scale's rounded-up buffer scale (2) is not the
+        // space (1.5 gives 1707x960).
+        assert_eq!(
+            ink_points((2560, 1440), 2.0, Some((1707.0, 960.0)), layer),
+            [1707.0, 960.0]
+        );
+        // No portal size (X11, or a portal that reports pixels): the pixels
+        // still give the overlay's points.
+        assert_eq!(ink_points((1920, 1080), 1.0, None, layer), [1920.0, 1080.0]);
     }
 
     /// The capsule is one 640×424 panel above everything, but only its pill
@@ -3776,7 +3816,11 @@ mod tests {
             window(capsule, own, [544.0, 0.0, 640.0, 424.0], 27),
             window(app, own + 1, [0.0, 0.0, 1728.0, 1117.0], 0),
         ];
-        let roles = [Some(capsule), Some(ink), None];
+        let roles = OwnWindowIds {
+            capsule: Some(capsule),
+            ink: Some(ink),
+            picker: None,
+        };
         let OwnWindows {
             excluded,
             passthrough,
@@ -3817,6 +3861,36 @@ mod tests {
         std::env::temp_dir().join(format!("hex-capture-{name}-{unique}"))
     }
 
+    /// A temp `audio.wav` in its own folder, with the folder made.
+    fn temp_wav(name: &str) -> PathBuf {
+        let dir = temp_dir(name);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("audio.wav")
+    }
+
+    fn wav_samples(path: &Path) -> Vec<i16> {
+        let mut reader = hound::WavReader::open(path).unwrap();
+        assert_eq!(reader.spec().sample_rate, 16_000);
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().bits_per_sample, 16);
+        reader
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// The samples a finished timeline's build publishes: the partial takes its
+    /// final name when the build journals the capture, not when it stops.
+    fn published_wav(audio: &mut RecordedAudio, path: &Path) -> Vec<i16> {
+        assert!(audio.is_on_disk());
+        assert!(audio.publish_audio(path.parent().unwrap()));
+        wav_samples(path)
+    }
+
+    fn remove_wav(path: &Path) {
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn a_screenshots_recording_keeps_every_pixel_and_a_capture_stays_compact() {
         let t0 = CaptureInstant::now();
@@ -3827,7 +3901,8 @@ mod tests {
 
     #[test]
     fn the_timeline_resamples_pads_gaps_and_ends_at_the_stop() {
-        let mut timeline = Timeline::new(t(0));
+        let path = temp_wav("timeline");
+        let mut timeline = Timeline::new(t(0), path.clone());
         // Audio starts 100 ms in (a cold microphone).
         let mut through = t(100);
         for _ in 0..50 {
@@ -3841,12 +3916,13 @@ mod tests {
             through = through + Duration::from_millis(10);
             timeline.push(&[0.5; 160], 16_000, through);
         }
-        let audio = timeline.finish(
+        let mut audio = timeline.finish(
             through.checked_sub(Duration::from_millis(100)).unwrap(),
             None,
         );
         assert_eq!(audio.sample_rate, 16_000);
         assert_eq!(audio.start_offset_ms, 100);
+        assert!(audio.samples.is_empty() && audio.is_on_disk());
         assert_eq!(
             audio.gaps,
             [GapSpan {
@@ -3856,15 +3932,41 @@ mod tests {
         );
         // 500 + 300 + 500 ms of audio, cut 100 ms before the last chunk.
         assert_eq!(audio.duration_ms(), 100 + 1_200);
-        let resampled_silence = &audio.samples[8_000 + 100..8_000 + 4_700];
-        assert!(resampled_silence.iter().all(|sample| *sample == 0.0));
+        assert_eq!(audio.sample_count(), 1_200 * 16);
+        // A stopped capture keeps its partial name until its build journals it.
+        assert!(!path.exists(), "audio.wav waits for the journal");
+        let samples = published_wav(&mut audio, &path);
+        assert_eq!(samples.len(), 100 * 16 + 1_200 * 16);
+        // The WAV keeps the leading 100 ms and the 300 ms gap as silence.
+        assert!(samples[..1_600].iter().all(|&sample| sample == 0));
+        assert!(
+            !path
+                .with_file_name(scrawl_capture::recover::PARTIAL_AUDIO)
+                .exists(),
+            "the streamed file is renamed, never left partial"
+        );
+        assert!(
+            samples[1_600 + 8_000..1_600 + 8_000 + 4_800]
+                .iter()
+                .all(|&sample| sample == 0)
+        );
+        assert!(
+            samples[1_600..9_600].iter().any(|&sample| sample != 0),
+            "the resampled first 500 ms is written"
+        );
+        assert!(
+            samples[14_400..].iter().all(|&sample| sample == pcm16(0.5)),
+            "the 16 kHz tail is written exactly"
+        );
+        remove_wav(&path);
     }
 
     #[test]
     fn a_pending_gap_and_a_stalled_tail_come_back_from_the_closed_sink() {
-        let mut timeline = Timeline::new(t(0));
+        let path = temp_wav("pending");
+        let mut timeline = Timeline::new(t(0), path.clone());
         timeline.push(&[0.5; 1_600], 16_000, t(100));
-        let audio = timeline.finish(
+        let mut audio = timeline.finish(
             t(600),
             Some(CaptureSinkClosed {
                 pending_gap: Some((t(100), t(300))),
@@ -3884,7 +3986,53 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(audio.samples.len(), 9_600);
+        assert_eq!(audio.sample_count(), 9_600);
+        assert_eq!(published_wav(&mut audio, &path).len(), 9_600);
+        remove_wav(&path);
+    }
+
+    #[test]
+    fn a_gap_is_digital_silence_where_it_happened() {
+        let path = temp_wav("gap");
+        let mut timeline = Timeline::new(t(0), path.clone());
+        timeline.push(&[0.5; 1_600], 16_000, t(100));
+        timeline.gap(t(100), t(400));
+        timeline.push(&[0.5; 1_600], 16_000, t(500));
+        let mut audio = timeline.finish(t(500), None);
+        assert_eq!(
+            audio.gaps,
+            [GapSpan {
+                start_ms: 100,
+                end_ms: 400
+            }]
+        );
+        let samples = published_wav(&mut audio, &path);
+        assert_eq!(samples.len(), 8_000);
+        assert!(samples[..1_600].iter().all(|&sample| sample == pcm16(0.5)));
+        assert!(samples[1_600..6_400].iter().all(|&sample| sample == 0));
+        assert!(samples[6_400..].iter().all(|&sample| sample == pcm16(0.5)));
+        remove_wav(&path);
+    }
+
+    #[test]
+    fn a_capture_longer_than_twenty_minutes_keeps_all_of_its_audio() {
+        let path = temp_wav("long");
+        let mut timeline = Timeline::new(t(0), path.clone());
+        // 21 minutes in 5 s chunks, the way the sink delivers them.
+        let chunk = vec![0.25_f32; 5 * 16_000];
+        let mut through = t(0);
+        for _ in 0..(21 * 60 / 5) {
+            through = through + Duration::from_secs(5);
+            timeline.push(&chunk, 16_000, through);
+        }
+        let mut audio = timeline.finish(through, None);
+        let expected = 21 * 60 * 16_000;
+        assert_eq!(audio.sample_count(), expected);
+        assert!(audio.is_on_disk() && audio.samples.is_empty());
+        assert!(audio.gaps.is_empty());
+        assert_eq!(audio.audio_stopped_at_ms(), None);
+        assert_eq!(published_wav(&mut audio, &path).len(), expected);
+        remove_wav(&path);
     }
 
     #[derive(Default)]
@@ -3937,18 +4085,25 @@ mod tests {
     impl Transcriber for FakeTranscriber {
         fn transcribe(&self, audio: &RecordedAudio) -> anyhow::Result<Option<TranscriptData>> {
             assert_eq!(audio.sample_rate, 16_000);
+            // Word times are from `samples[0]`; a streamed capture's file
+            // starts with its own leading silence, so the words move with it.
+            let lead_ms = audio
+                .samples
+                .iter()
+                .position(|sample| *sample != 0.0)
+                .map_or(0, |lead| lead as u64 * 1_000 / u64::from(audio.sample_rate));
             Ok(Some(TranscriptData {
                 source: "fake".into(),
                 text: "hello there".into(),
                 words: vec![
                     WordTiming {
-                        t0: 0,
-                        t1: 200,
+                        t0: lead_ms,
+                        t1: lead_ms + 200,
                         text: "hello".into(),
                     },
                     WordTiming {
-                        t0: 250,
-                        t1: 500,
+                        t0: lead_ms + 250,
+                        t1: lead_ms + 500,
                         text: "there".into(),
                     },
                 ],
@@ -4079,8 +4234,9 @@ mod tests {
                 Some(&*self.transcriber),
             )?;
             Ok(Written {
-                words: bundle.transcript.words.len(),
+                words: scrawl_capture::transcribe::word_count(&bundle.transcript),
                 gaps,
+                audio_stopped_at_ms: None,
                 missing_transcript: bundle.transcript.missing.map(|missing| missing.reason),
             })
         }
@@ -4128,12 +4284,10 @@ mod tests {
         let idle = report(host.control(ScrawlCaptureAction::Stop, &audio));
         assert!(!idle.changed && idle.bundle.is_none());
         // Paste and Inspect need a written capture.
-        for command in [CaptureCommand::Paste, CaptureCommand::Inspect] {
-            assert!(matches!(
-                host.command(command, &audio),
-                ControlReply::Error { .. }
-            ));
-        }
+        assert!(matches!(
+            host.command(CaptureCommand::Inspect, &audio),
+            ControlReply::Error { .. }
+        ));
         assert!(!report(host.control(ScrawlCaptureAction::Cancel, &audio)).changed);
 
         let started = report(host.control(ScrawlCaptureAction::Start, &audio));
@@ -4161,11 +4315,19 @@ mod tests {
 
         let last = wait_for_last(&mut host, &audio, &bundle, true);
         assert_eq!(last.stage, "done");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            paste_source::Scope::new(&dir, Some(7)).rows(1, crate::history::now_ms())[0].2,
+            "hello there"
+        );
         assert_eq!(last.words, Some(2));
         let snapshot = lock(&host.outcomes).snapshot();
         assert!(snapshot.recording.is_none() && snapshot.finishing.is_empty());
         assert_eq!(snapshot.last.unwrap().stage, Stage::Done);
-        for command in [CaptureCommand::Paste, CaptureCommand::Inspect] {
+        for command in [
+            CaptureCommand::Paste(bundle.clone()),
+            CaptureCommand::Inspect,
+        ] {
             assert!(report(host.command(command, &audio)).changed);
         }
         // The fake audio ends before the stop, so the tail may count as a gap.
@@ -4335,16 +4497,17 @@ mod tests {
     }
 
     #[test]
-    fn padding_past_the_length_limit_stays_bounded() {
-        let mut timeline = Timeline::with_limit(t(0), Duration::from_secs(1));
+    fn past_the_guard_the_file_stops_and_the_rest_is_one_gap() {
+        let path = temp_wav("guard");
+        let mut timeline = Timeline::with_limit(t(0), path.clone(), Duration::from_secs(1));
         timeline.push(&[0.5; 1_600], 16_000, t(100));
-        // A gap far past the limit pads only up to it.
+        // A gap far past the guard pads only up to it.
         timeline.gap(t(100), t(3 * 60 * 60 * 1_000));
-        assert!(timeline.samples.len() <= 16_000);
         timeline.gap(t(3 * 60 * 60 * 1_000), t(6 * 60 * 60 * 1_000));
         timeline.push(&[0.5; 1_600], 16_000, t(6 * 60 * 60 * 1_000 + 100));
-        let audio = timeline.finish(t(6 * 60 * 60 * 1_000 + 100), None);
-        assert_eq!(audio.samples.len(), 16_000);
+        let mut audio = timeline.finish(t(6 * 60 * 60 * 1_000 + 100), None);
+        assert_eq!(audio.sample_count(), 16_000);
+        assert_eq!(published_wav(&mut audio, &path).len(), 16_000);
         assert_eq!(
             audio.gaps,
             [
@@ -4358,6 +4521,67 @@ mod tests {
                 }
             ]
         );
+        remove_wav(&path);
+    }
+
+    #[test]
+    fn the_guard_records_where_the_audio_stopped() {
+        let path = temp_wav("guard-point");
+        let mut timeline = Timeline::with_limit(t(0), path.clone(), Duration::from_secs(1));
+        timeline.push(&[0.5; 1_600], 16_000, t(100));
+        // Past the guard: the first second is kept, the rest is one gap.
+        timeline.push(&[0.5; 16_000], 16_000, t(1_100));
+        let mut audio = timeline.finish(t(1_100), None);
+        assert_eq!(audio.audio_stopped_at_ms(), Some(1_000));
+        assert_eq!(audio.sample_count(), 16_000);
+        assert_eq!(published_wav(&mut audio, &path).len(), 16_000);
+        remove_wav(&path);
+
+        // A capture that stays inside the guard says nothing.
+        let path = temp_wav("guard-point-short");
+        let mut timeline = Timeline::with_limit(t(0), path.clone(), Duration::from_secs(1));
+        timeline.push(&[0.5; 1_600], 16_000, t(100));
+        let audio = timeline.finish(t(100), None);
+        assert_eq!(audio.audio_stopped_at_ms(), None);
+        assert_eq!(audio.sample_count(), 1_600);
+        remove_wav(&path);
+    }
+
+    #[test]
+    fn a_mid_capture_write_failure_stops_where_the_file_stopped() {
+        let path = temp_wav("mid-failure");
+        let mut timeline = Timeline::new(t(0), path.clone());
+        timeline.push(&[0.5; 1_600], 16_000, t(100));
+        timeline.push(&[0.5; 1_600], 16_000, t(200));
+        // The disk refuses the next chunk: 200 ms reached the file.
+        timeline.write_failed(t(250));
+        timeline.push(&[0.5; 1_600], 16_000, t(300));
+        let mut audio = timeline.finish(t(300), None);
+        assert_eq!(audio.audio_stopped_at_ms(), Some(200));
+        assert_eq!(audio.sample_count(), 3_200);
+        assert_eq!(published_wav(&mut audio, &path).len(), 3_200);
+        assert_eq!(audio.gaps.last().map(|gap| gap.end_ms), Some(300));
+        remove_wav(&path);
+    }
+
+    #[test]
+    fn a_write_failure_stops_the_audio_where_the_file_stopped() {
+        let dir = temp_dir("write-failure");
+        fs::create_dir_all(&dir).unwrap();
+        // A regular file where the bundle folder should be: `audio.wav.partial`
+        // cannot be opened under it.
+        let blocked = dir.join("blocked");
+        fs::write(&blocked, b"not a folder").unwrap();
+        let mut timeline = Timeline::new(t(0), blocked.join("audio.wav"));
+        timeline.push(&[0.5; 1_600], 16_000, t(100));
+        timeline.push(&[0.5; 1_600], 16_000, t(200));
+        let audio = timeline.finish(t(200), None);
+        // The first sound was at 0 ms and nothing reached the disk, so the audio
+        // stops there instead of claiming a file.
+        assert_eq!(audio.audio_stopped_at_ms(), Some(0));
+        assert!(!audio.is_on_disk());
+        assert_eq!(audio.sample_count(), 0);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Holds every transcription until the test lets it through.
@@ -4666,6 +4890,9 @@ mod tests {
             (recording.target, recording.worked),
             (TargetKind::Pointer, false)
         );
+        // Some audio, so discarding also closes and removes its partial file.
+        audio.feed(160, recording.since + Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(20));
 
         let discarded = report(host.command(CaptureCommand::Discard, &audio));
         assert!(discarded.changed);
@@ -4679,6 +4906,10 @@ mod tests {
         assert!(audio.open.lock().unwrap().is_none(), "the sink is closed");
         wait_until_idle(&host);
         assert!(!first.exists());
+        assert!(
+            !first.join("audio.wav").exists() && !first.join("audio.wav.partial").exists(),
+            "the streamed file is gone"
+        );
         assert_eq!(lock(&host.outcomes).snapshot(), CaptureSnapshot::default());
         assert!(
             report(host.control(ScrawlCaptureAction::Status, &audio))
@@ -4729,12 +4960,19 @@ mod tests {
         let start = engine.starts.lock().unwrap()[0].clone();
         assert!(matches!(start.target, Target::Phone { .. }));
         assert_eq!(start.audio, AudioIn::External);
+        // Some narration, so the finish has a streamed partial to publish.
+        audio.feed(1_600, recording.since + Duration::from_millis(100));
 
         // Unplugged: the next look at the host finishes what it recorded.
         lock(&host.outcomes).phone_ended = true;
         assert_eq!(host.recording_since(&audio), None);
         let last = wait_for_last(&mut host, &audio, &bundle, true);
         assert_eq!(last.stage, "done");
+        assert!(bundle.join("audio.wav").is_file());
+        assert!(
+            !bundle.join(scrawl_capture::recover::PARTIAL_AUDIO).exists(),
+            "a finished iPhone bundle keeps no streamed partial"
+        );
         host.shutdown(&audio);
         fs::remove_dir_all(dir).ok();
     }
@@ -5005,7 +5243,7 @@ mod tests {
         let settled = lock(&host.outcomes).snapshot().last.unwrap();
         assert_eq!(settled.error.as_deref(), Some("the window closed"));
         assert!(matches!(
-            host.command(CaptureCommand::Paste, &audio),
+            host.command(CaptureCommand::Inspect, &audio),
             ControlReply::Error { .. }
         ));
         host.shutdown(&audio);
@@ -5271,16 +5509,21 @@ mod tests {
         ] {
             assert!(!capsule_key(key.clone()), "{key:?}");
         }
-        // The toast's one guess at a time: Return sends it, Tab moves on.
+        // A toast appearing over another app never takes its Return or Tab.
         second.set(CapsuleKeys::Suggest {
             cycle: true,
             search: false,
         });
         assert!(suggesting());
+        assert!(!capsule_key(CapsuleKey::Tab { shift: false }));
+        assert!(!capsule_key(CapsuleKey::Return { shift: false }));
+        second.set(CapsuleKeys::Suggest {
+            cycle: true,
+            search: true,
+        });
         assert!(capsule_key(CapsuleKey::Tab { shift: false }));
         assert!(capsule_key(CapsuleKey::Return { shift: false }));
         assert!(!capsule_key(CapsuleKey::Return { shift: true }));
-        assert!(!capsule_key(CapsuleKey::Text("h".into())));
         second.set(CapsuleKeys::List);
         assert!(!suggesting());
         assert!(list_open() && !wants_escape());
@@ -5395,6 +5638,7 @@ mod tests {
             Some(Written {
                 words: 3,
                 gaps: 0,
+                audio_stopped_at_ms: None,
                 missing_transcript: None,
             }),
         );
